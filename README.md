@@ -18,7 +18,22 @@ must not reach players' devices).
 
 `R3FTO-Example.rbxl` in the same release is the example game, ready to open.
 
-### B. Rojo with Git
+### B. Rojo with Wally
+
+```toml
+# wally.toml
+[server-dependencies]
+R3FTO = "mrcha0s/r3fto-roblox-sdk@0.1.0"
+```
+
+Run `wally install`, map `ServerPackages` into ServerScriptService in your Rojo project, then use this line in place of
+`require(ServerScriptService:WaitForChild("R3FTO"))` in your scripts:
+
+```lua
+local R3FTO = require(game:GetService("ServerScriptService").ServerPackages.R3FTO)
+```
+
+### C. Rojo with Git
 
 ```bash
 git submodule add https://github.com/R3Fto/roblox-sdk.git vendor/r3fto-roblox-sdk
@@ -32,7 +47,7 @@ git -C vendor/r3fto-roblox-sdk checkout v0.1.0
 }
 ```
 
-### C. By hand
+### D. By hand
 
 Create these objects in Roblox Studio (names must match exactly) and paste each file into the object of the same name:
 
