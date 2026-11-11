@@ -90,12 +90,3 @@ Press **Play** in Studio (server and client).
 - **Both fail.** Combine the two. The durability stays `memory_only` and becomes `not_durable` after the 300-second
   attempt. Closing the server prints `[R3FTO] server closing with 1 receipt(s) that have no durable copy yet`. Evidence
   in this state can be lost. Nothing invents it later.
-
-## What this proves, and what it does not
-
-| Checked | How |
-|---|---|
-| Retry offsets, a channel that stops after it succeeds, duplicate callbacks, an immutable first observation time, independent DataStore and transport failures, a call that never yields | Automated: `luau tests/run.luau` (plain Luau with the SDK's real modules over fake Roblox services) |
-| R3FTO stores a receipt once, answers only after its database commit, and keeps Test and Production apart | Automated on the R3FTO side |
-| This example in Roblox Studio, real `DataStoreService`, `HttpService`, Secrets and `ProcessReceipt` | **Not automated.** Follow "Run it" above. |
-| Real paid purchases, desktop and mobile launch links carrying LaunchData | **Not automated.** A Studio test purchase is not a real paid purchase. The creator-link transport into Roblox is not ready yet (see the main `README.md`). |

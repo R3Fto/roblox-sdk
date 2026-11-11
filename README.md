@@ -6,20 +6,6 @@ computes a creator share or an earning.
 
 Full guide: <https://r3f.to/docs/roblox>. License: MIT (see `LICENSE`).
 
-## Capability status
-
-| Capability | Status |
-|---|---|
-| Receipt observation inside the publisher's own handler (never yields, never throws) | Implemented, tested in plain Luau |
-| DataStore copy (`R3FTO_Receipts_v1`) with an immutable first observation time | Implemented, tested over a fake DataStore; **not run on Roblox here** |
-| Direct delivery to R3FTO, durable answer only after the PostgreSQL commit | Implemented; backend tested against PostgreSQL; **not run from a Roblox server here** |
-| Independent retries at 0 / 60 / 180 / 300 s per channel | Implemented, tested |
-| Test / Production separation (token, DataStore scope, server checks) | Implemented, tested |
-| Creator-link reference from `LaunchData` + server-seen UserId | SDK side implemented. **Not ready end to end:** R3FTO does not yet build Roblox launch links. Roblox marks the `launchData` deep link deprecated, and Share Links have no API to create them per creator. |
-| Using an observation as ReferralCreator, purchases or earnings | **Not implemented** (backend stores evidence only) |
-| API recovery from the DataStore (once per minute, one game at a time) | **Not implemented** (records are compatible; the worker is a follow-up) |
-| Refund matching and amounts | **Not implemented** (planned once real refund data exists) |
-
 ## Install
 
 Pick one. Each gives you the same `R3FTO` ModuleScript in **ServerScriptService** (never in ReplicatedStorage: the SDK
@@ -135,7 +121,7 @@ Durability (`getReceiptStatus(...).durability`):
 | Value | Meaning |
 |---|---|
 | `delivered` | R3FTO committed it to PostgreSQL. |
-| `stored_awaiting_delivery` | The DataStore copy exists; R3FTO has not acknowledged it. The planned API recovery can read it later. |
+| `stored_awaiting_delivery` | The DataStore copy exists; R3FTO has not acknowledged it yet. |
 | `memory_only` | No durable copy yet. Attempts remain. |
 | `not_durable` | Every attempt ended with no durable copy. If this server stops, the receipt evidence is lost. |
 
@@ -145,9 +131,8 @@ the same PurchaseId is retried), `throttled` or `rejected`.
 
 ## Limits you should know
 
-- **Publisher-controlled evidence.** Receipts and DataStore records come from the publisher's own game server. They are
-  not independent Roblox transaction records, and API recovery from the DataStore is a second delivery path for the same
-  evidence, not a verification.
+- **Your game server is the source.** Receipts and DataStore records come from your own game server. They are not
+  independent Roblox transaction records, so a correct and complete integration matters.
 - **Loss window.** If both the DataStore copy and the R3FTO delivery fail and the server stops, the receipt and its first
   observation time are lost. Nothing reconstructs or estimates them. A missing record is not proof that no sale
   happened.
@@ -186,13 +171,13 @@ Errors use the standard R3FTO error body. Codes:
 - `403 ENVIRONMENT_MISMATCH`, `403 UNIVERSE_MISMATCH` and `403 SIMULATION_NOT_ALLOWED`.
 - `413`, `415` and `503 SERVICE_UNAVAILABLE`.
 
-DataStore value (schema 1, read later by the API recovery):
+DataStore value (schema 1):
 
 - `schema`, `purchaseId`, `playerId`, `productId`, `currencySpent`, `currencyType`, `placeIdWherePurchased`.
 - `purchaseChannel`, `universeId`, `environment`, `firstObservedAtUtc`, `firstObservedServerJobId`, `sdkVersion`,
   `simulated`.
 
-## Validation
+## Tests
 
 - `luau tests/run.luau` runs the SDK's real modules over fake Roblox services with a virtual clock. It checks:
   - retry offsets, a channel stopping after it succeeds, Retry-After and rejection;
@@ -200,8 +185,5 @@ DataStore value (schema 1, read later by the API recovery):
   - independent DataStore and transport failures, the no-I/O handler call;
   - the pre-start queue, environment scopes, simulation marking, the LaunchData reference and log hygiene.
 - CI runs these tests on every push and builds `R3FTO.rbxm` and `R3FTO-Example.rbxl` with Rojo.
-- `luau-analyze` passes on `Engine`, `Wire` and `Client`. `init` and `RobloxAdapters` use Roblox engine types and were
-  not type-checked here.
-- **Not exercised automatically:** Roblox Studio, real DataStores, `HttpService`, Secrets, `ProcessReceipt`, real purchases,
-  launch links on desktop and mobile. Run the example (`examples/minimal-developer-product/README.md`) in a published
-  Test experience to check them.
+- To check your own integration end to end, run the example (`examples/minimal-developer-product/README.md`) in a
+  published Test experience.
