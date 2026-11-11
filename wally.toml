@@ -1,5 +1,5 @@
 [package]
-name = "r3fto/roblox-sdk"
+name = "mrcha0s/r3fto-roblox-sdk"
 description = "R3FTO server SDK for Roblox. Reports developer product receipts from your game server to R3FTO."
 version = "0.1.0"
 license = "MIT"
