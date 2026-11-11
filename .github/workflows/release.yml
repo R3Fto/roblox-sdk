@@ -1,0 +1,94 @@
+name: build-and-release
+
+# Every push and pull request: run the plain-Luau tests and build the model files.
+# A "vX.Y.Z" tag: also check the version numbers and publish a GitHub Release with the files attached.
+#
+# Supply chain: tools are pinned by version and SHA-256, actions by commit SHA. Downloaded tools run only in the
+# read-only "build" job; the "release" job, which can write, runs no downloaded binary.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ROJO_URL: https://github.com/rojo-rbx/rojo/releases/download/v7.7.1/rojo-7.7.1-linux-x86_64.zip
+  ROJO_SHA256: 00feb4fa0829a1dd72b49df2639da519a352bfe13cadcd83969e2ba2bb5693c4
+  LUAU_URL: https://github.com/luau-lang/luau/releases/download/0.744/luau-ubuntu.zip
+  LUAU_SHA256: 6506f0852c623aaffcb28494aac16c26dc04a269ea0e16cc0aafc8c8ac79f3ec
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rojo and Luau (pinned, SHA-256 checked)
+        run: |
+          mkdir -p "$RUNNER_TEMP/dl" "$RUNNER_TEMP/bin"
+          curl -fsSL "$ROJO_URL" -o "$RUNNER_TEMP/dl/rojo.zip"
+          curl -fsSL "$LUAU_URL" -o "$RUNNER_TEMP/dl/luau.zip"
+          printf '%s  %s\n' "$ROJO_SHA256" "$RUNNER_TEMP/dl/rojo.zip" "$LUAU_SHA256" "$RUNNER_TEMP/dl/luau.zip" | sha256sum -c -
+          unzip -o "$RUNNER_TEMP/dl/rojo.zip" rojo -d "$RUNNER_TEMP/bin"
+          unzip -o "$RUNNER_TEMP/dl/luau.zip" luau -d "$RUNNER_TEMP/bin"
+          chmod +x "$RUNNER_TEMP/bin/rojo" "$RUNNER_TEMP/bin/luau"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Tests (plain Luau over fake Roblox services)
+        run: luau tests/run.luau
+
+      - name: Check version numbers
+        run: |
+          code=$(sed -n 's/^return "\(.*\)"$/\1/p' src/R3FTO/Version.luau)
+          wally=$(sed -n 's/^version = "\(.*\)"$/\1/p' wally.toml)
+          echo "Version.luau=$code wally.toml=$wally"
+          test -n "$code" && test "$code" = "$wally"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "tag=${GITHUB_REF_NAME#v}"
+            test "${GITHUB_REF_NAME#v}" = "$code"
+          fi
+
+      - name: Build R3FTO.rbxm and the example place
+        run: |
+          rojo build default.project.json -o R3FTO.rbxm
+          rojo build examples/minimal-developer-product -o R3FTO-Example.rbxl
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: r3fto-roblox-sdk
+          path: |
+            R3FTO.rbxm
+            R3FTO-Example.rbxl
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: r3fto-roblox-sdk
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '$0 ~ "^## "v" " {on=1; next} /^## / {on=0} on' CHANGELOG.md > notes.md
+          gh release create "$GITHUB_REF_NAME" R3FTO.rbxm R3FTO-Example.rbxl \
+            --title "R3FTO Roblox SDK $version" --notes-file notes.md

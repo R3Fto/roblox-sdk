@@ -1,0 +1,11 @@
+# Build outputs (CI attaches them to the GitHub Release)
+*.rbxm
+*.rbxl
+*.rbxmx
+*.rbxlx
+
+# Rojo / Wally / tooling
+Packages/
+ServerPackages/
+DevPackages/
+sourcemap.json

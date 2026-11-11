@@ -1,0 +1,13 @@
+[package]
+name = "r3fto/roblox-sdk"
+description = "R3FTO server SDK for Roblox. Reports developer product receipts from your game server to R3FTO."
+version = "0.1.0"
+license = "MIT"
+authors = ["R3FTO"]
+realm = "server"
+registry = "https://github.com/UpliftGames/wally-index"
+homepage = "https://r3f.to/docs/roblox"
+repository = "https://github.com/R3Fto/roblox-sdk"
+exclude = ["examples", "tests", ".github", "*.rbxm", "*.rbxl"]
+
+[dependencies]

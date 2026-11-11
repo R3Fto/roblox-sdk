@@ -1,0 +1,20 @@
+{
+  "name": "R3FTO Minimal Example",
+  "tree": {
+    "$className": "DataModel",
+    "ServerScriptService": {
+      "$className": "ServerScriptService",
+      "$path": "ServerScriptService",
+      "R3FTO": {
+        "$path": "../../src/R3FTO"
+      }
+    },
+    "StarterPlayer": {
+      "$className": "StarterPlayer",
+      "StarterPlayerScripts": {
+        "$className": "StarterPlayerScripts",
+        "$path": "StarterPlayer/StarterPlayerScripts"
+      }
+    }
+  }
+}
