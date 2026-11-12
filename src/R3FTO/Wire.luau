@@ -3,8 +3,9 @@
 --
 -- * Validates the receiptInfo table Roblox passes to the publisher's own receipt handler.
 -- * Builds the DataStore record (DataStore "R3FTO_Receipts_v1", scope = environment, key = PurchaseId, schema 1).
--- * Builds the JSON bodies of POST /v1/roblox-sdk/receipts and /v1/roblox-sdk/referral-observations. Roblox ids and
---   Robux amounts travel as decimal STRINGS so nothing can round them (Luau numbers are doubles).
+-- * Builds the JSON bodies of POST /v1/roblox-sdk/receipts, /v1/roblox-sdk/referral-observations and
+--   /v1/roblox-sdk/heartbeats. Roblox ids and Robux amounts travel as decimal STRINGS so nothing can round them (Luau
+--   numbers are doubles).
 -- * Classifies an HTTP answer into the engine's attempt result.
 -- * Reads the R3FTO creator-link reference from LaunchData.
 
@@ -16,6 +17,7 @@ Wire.MAX_DATASTORE_KEY = 50 -- Roblox: key names are at most 50 characters
 Wire.MAX_PURCHASE_ID = 100 -- R3FTO: purchase_id is at most 100 characters
 Wire.RECEIPTS_PATH = "/v1/roblox-sdk/receipts"
 Wire.REFERRALS_PATH = "/v1/roblox-sdk/referral-observations"
+Wire.HEARTBEATS_PATH = "/v1/roblox-sdk/heartbeats"
 Wire.SIMULATED_PREFIX = "r3fto-sim-"
 
 local MAX_SAFE_INTEGER = 9007199254740991 -- 2^53 - 1: above it a Luau number is no longer an exact integer
@@ -141,7 +143,8 @@ export type Context = {
 	sdkVersion: string,
 }
 
--- The DataStore value (schema 1). camelCase, as Roblox data usually is; read back by the API recovery check (K-47).
+-- The DataStore value (schema 1). camelCase, as Roblox data usually is; R3FTO's recovery check reads it back through the
+-- Roblox DataStore API.
 function Wire.receiptRecord(receipt: Receipt, firstObservedAtUtc: string, context: Context, simulated: boolean)
 	return {
 		schema = Wire.SCHEMA,
@@ -173,7 +176,8 @@ function Wire.isRecord(value: any, purchaseId: string): boolean
 end
 
 -- The purchase facts two records of one PurchaseId must share. The observation time is NOT compared: when another
--- server observed the receipt first, its earlier time is the one kept (K-43) and that is not a mismatch.
+-- server observed the receipt first, its earlier time is the one kept (the first observation time never changes) and
+-- that is not a mismatch.
 function Wire.samePurchase(a: any, b: any): boolean
 	return a.purchaseId == b.purchaseId
 		and a.playerId == b.playerId
@@ -215,6 +219,33 @@ function Wire.referralBody(userId: string, reference: string, observedAtUtc: str
 		roblox_user_id = userId,
 		launch_reference = reference,
 		observed_at = observedAtUtc,
+	}
+end
+
+-- This server's receipts by durability (see Engine.durability), as the server signal reports them.
+export type ReceiptCounts = {
+	memory_only: number,
+	stored_awaiting_delivery: number,
+	not_durable: number,
+}
+
+-- POST /v1/roblox-sdk/heartbeats body: one server signal ("started" | "alive" | "closing"). Integration data only: the
+-- environment, universe, place, server job id, SDK version, the kind, the send time and this server's receipt counts.
+-- No PlayerId and nothing about players.
+function Wire.heartbeatBody(kind: string, sentAtUtc: string, counts: ReceiptCounts, context: Context, serverJobId: string)
+	return {
+		environment = context.environment,
+		universe_id = context.universeId,
+		place_id = context.placeId,
+		server_job_id = serverJobId,
+		sdk_version = context.sdkVersion,
+		kind = kind,
+		sent_at = sentAtUtc,
+		receipts = {
+			memory_only = counts.memory_only,
+			stored_awaiting_delivery = counts.stored_awaiting_delivery,
+			not_durable = counts.not_durable,
+		},
 	}
 end
 

@@ -10,6 +10,9 @@
 --   R3FTO.getDiagnostics() -> table (no token, no PlayerId)
 --   R3FTO.VERSION
 --
+-- After start the SDK also sends a server signal: "started" once, "alive" every hour and "closing" when the server shuts
+-- down, each with this server's receipt counts. It never affects a purchase.
+--
 -- The SDK never sets MarketplaceService.ProcessReceipt and never calls BindReceiptHandler: your handler stays the only
 -- one, grants the product and returns the purchase decision. It observes receipts; it does not grant or verify them.
 
@@ -94,6 +97,8 @@ local runtime = {
 			task.defer(observe, player)
 		end
 	end,
+	-- The close callback warns about receipts without a durable copy and sends the "closing" signal, waiting for it at
+	-- most a few seconds of Roblox's 30-second shutdown limit.
 	onClose = function(callback: () -> ())
 		game:BindToClose(callback)
 	end,

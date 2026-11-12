@@ -4,19 +4,30 @@
 -- Every Roblox service reaches this module through one `runtime` table, so the same code runs on a game server
 -- (init.luau builds the runtime from the real services) and in the plain-Luau tests (fakes with the same shape).
 --
--- What this module does, and what it never does (report §10.19, §10.21, K-42–K-46):
+-- What this module does, and what it never does:
 -- * observeReceipt() records the first observation time at once, before any yield or network call, queues the work and
 --   returns. It never yields, never throws, never grants a product and never returns a ProductPurchaseDecision: the
 --   publisher's own receipt handler stays the one handler and decides PurchaseGranted / NotProcessedYet itself.
--- * The work is two independent channels with the K-46 schedule: the DataStore copy and the direct R3FTO delivery.
+-- * The work is two independent channels on the Engine's retry schedule: the DataStore copy and the direct R3FTO
+--   delivery.
 -- * Duplicate calls for the same PurchaseId on this server join the existing work; they never restart it.
 -- * The SDK reports evidence. It computes no creator share and no earning.
+-- * The server signal tells R3FTO that this server runs the SDK: "started" once after start, "alive" every hour and
+--   "closing" once while the server shuts down, each with this server's receipt counts by durability. It runs in its own
+--   thread, never inside the receipt handler, never as an Engine job and never retried: a failed signal is followed by
+--   the next one on schedule. It never affects a purchase.
 
 local Client = {}
 Client.__index = Client
 
 Client.DEFAULT_TOKEN_SECRET = "R3FTO_SDK_TOKEN"
 Client.DEFAULT_API_BASE_URL = "https://r3f.to"
+
+-- The server signal: one "alive" every hour after "started" (counted from start, so it never drifts), and how long the
+-- "closing" signal may hold up shutdown (Roblox gives every BindToClose callback together at most 30 seconds).
+Client.HEARTBEAT_INTERVAL = 3600
+Client.CLOSING_WAIT_LIMIT = 5
+Client.CLOSING_POLL = 0.25
 
 local ENVIRONMENTS = { production = true, test = true }
 
@@ -67,6 +78,10 @@ function Client.new(runtime: Runtime)
 	self._store = nil :: any
 	self._problems = {} :: { string }
 	self._quiet = false
+	self._closed = false
+	self._signalJobId = nil :: string?
+	self._signalRefusalWarned = false
+	self._heartbeat = { lastKind = nil :: string?, lastSentAtUtc = nil :: string?, lastResult = nil :: string? }
 	return self
 end
 
@@ -146,7 +161,102 @@ function Client:start(config: any): (boolean, string?)
 	runtime.onClose(function()
 		self:_onClose()
 	end)
+
+	-- Studio has no JobId (it is empty), so a Studio session signals with its own id, made once here.
+	local jobId = runtime.jobId()
+	self._signalJobId = if type(jobId) == "string" and #jobId > 0 then jobId else "studio-" .. runtime.generateId()
+	self:_startHeartbeat()
 	return true, nil
+end
+
+-- This server's receipts by durability, for the whole life of the server (delivered receipts are not counted).
+function Client:_receiptCounts(): { [string]: number }
+	local counts = { memory_only = 0, stored_awaiting_delivery = 0, not_durable = 0 }
+	for key, job in self._engine:jobs() do
+		if string.sub(key, 1, 8) == "receipt:" then
+			local durability = self._runtime.Engine.durability(job)
+			if counts[durability] ~= nil then
+				counts[durability] += 1
+			end
+		end
+	end
+	return counts
+end
+
+-- Sends one server signal now, in the calling thread: one attempt, never retried. Never throws.
+function Client:_signal(kind: string)
+	local runtime = self._runtime
+	local wire = runtime.Wire
+	local sentAtUtc = wire.isoUtcFromMillis(runtime.unixMillis())
+	local body = wire.heartbeatBody(kind, sentAtUtc, self:_receiptCounts(), self._context, self._signalJobId)
+	local state = self._heartbeat
+	state.lastKind = kind
+	state.lastSentAtUtc = sentAtUtc
+	state.lastResult = "sending"
+	local called, outcome = pcall(self._post, wire.HEARTBEATS_PATH, body)
+	if not called or type(outcome) ~= "table" then
+		outcome = { ok = false, kind = "ambiguous", detail = "the signal raised an error" }
+	end
+	if outcome.ok then
+		state.lastResult = "recorded"
+		self:_say("info", "server signal " .. kind .. " sent")
+		return
+	end
+	state.lastResult = tostring(outcome.kind)
+	if outcome.kind == "rejected" and not self._signalRefusalWarned then
+		-- A refusal (the token, the environment, the universe or the request) repeats on every signal: say it once.
+		self._signalRefusalWarned = true
+		self:_say("warn", "R3FTO refused the server signal (" .. tostring(outcome.detail) .. "); check the SDK token and the environment. Receipts are not affected")
+		return
+	end
+	self:_say("info", "server signal " .. kind .. " failed (" .. tostring(outcome.kind) .. ", " .. tostring(outcome.detail) .. "); the next one follows on schedule")
+end
+
+-- "started" now, then "alive" every HEARTBEAT_INTERVAL seconds from start, in one spawned thread that stops at close.
+function Client:_startHeartbeat()
+	local runtime = self._runtime
+	local startedAt = runtime.now()
+	runtime.spawn(function()
+		if self._closed then
+			return
+		end
+		pcall(self._signal, self, "started")
+		local beat = 1
+		while true do
+			local wait = startedAt + beat * Client.HEARTBEAT_INTERVAL - runtime.now()
+			if wait > 0 then
+				runtime.sleep(wait)
+			end
+			if self._closed then
+				return
+			end
+			pcall(self._signal, self, "alive")
+			-- A slow signal never causes a burst: a missed hour is skipped, not caught up.
+			beat = math.max(beat + 1, math.floor((runtime.now() - startedAt) / Client.HEARTBEAT_INTERVAL) + 1)
+		end
+	end)
+end
+
+-- "closing": one attempt in its own thread; shutdown waits for it at most CLOSING_WAIT_LIMIT seconds.
+function Client:_closingSignal()
+	if self._closed then
+		return
+	end
+	self._closed = true
+	local runtime = self._runtime
+	local done = false
+	runtime.spawn(function()
+		pcall(self._signal, self, "closing")
+		done = true
+	end)
+	local deadline = runtime.now() + Client.CLOSING_WAIT_LIMIT
+	while not done do
+		local remaining = deadline - runtime.now()
+		if remaining <= 0 then
+			return
+		end
+		runtime.sleep(math.min(Client.CLOSING_POLL, remaining))
+	end
 end
 
 function Client:_receiptChannels(purchaseId: string)
@@ -192,7 +302,7 @@ end
 -- The shared path of observeReceipt and simulateTestReceipt. Never yields, never throws.
 function Client:_observe(receiptInfo: any, simulated: boolean): { [string]: any }
 	local runtime = self._runtime
-	-- K-43: the observation time is taken first, before anything that could yield.
+	-- The observation time is taken first, before anything that could yield, and it never changes afterwards.
 	local firstObservedAtUtc = runtime.Wire.isoUtcFromMillis(runtime.unixMillis())
 	local receipt, reason = runtime.Wire.readReceipt(receiptInfo)
 	if receipt == nil then
@@ -298,9 +408,10 @@ function Client:_onClose()
 		end
 	end
 	if memoryOnly > 0 or #self._waiting > 0 then
-		-- No extra attempt is made here (K-46 caps attempts); this only makes the possible loss visible.
+		-- No extra attempt is made here (the retry schedule caps attempts); this only makes the possible loss visible.
 		self:_say("warn", string.format("server closing with %d receipt(s) that have no durable copy yet and %d never started", memoryOnly, #self._waiting))
 	end
+	self:_closingSignal()
 end
 
 -- R3FTO.getReceiptStatus(purchaseId): this server's view of one receipt, or nil.
@@ -333,6 +444,7 @@ function Client:getDiagnostics(): { [string]: any }
 		end
 	end
 	local problems = table.clone(self._problems)
+	local heartbeat = self._heartbeat
 	return {
 		sdkVersion = self._runtime.sdkVersion,
 		started = self._started,
@@ -342,6 +454,12 @@ function Client:getDiagnostics(): { [string]: any }
 		receiptsWaitingForStart = #self._waiting,
 		referralObservations = referrals,
 		problems = problems,
+		-- The latest server signal: its kind, when it was sent (UTC) and "sending", "recorded" or the failure kind.
+		heartbeat = {
+			lastKind = heartbeat.lastKind,
+			lastSentAtUtc = heartbeat.lastSentAtUtc,
+			lastResult = heartbeat.lastResult,
+		},
 	}
 end
 

@@ -11,6 +11,10 @@ local Fakes = {}
 
 Fakes.BASE_MILLIS = 1762857045123 -- 2025-11-11T10:30:45.123Z at virtual time 0
 
+-- run() without a limit stops this many virtual seconds after the current time: the hourly server signal never stops on
+-- its own, and every receipt schedule settles well within it (its last retry is 300 seconds after the first attempt).
+Fakes.SETTLE = 3000
+
 -- Virtual time. spawn() queues a coroutine at the current time; sleep() (only inside a queued coroutine) parks it.
 function Fakes.scheduler()
 	local s = { t = 0, queue = {}, seq = 0, sleeps = {} }
@@ -25,32 +29,40 @@ function Fakes.scheduler()
 		table.insert(s.sleeps, seconds)
 		coroutine.yield(s.t + seconds)
 	end
-	-- Runs until nothing is queued, or until virtual time would pass `untilTime`.
+	-- Runs the earliest queued coroutine due at or before `limit`. Returns false when there is none.
+	function s.step(limit)
+		if #s.queue == 0 then
+			return false
+		end
+		table.sort(s.queue, function(a, b)
+			if a.at == b.at then
+				return a.seq < b.seq
+			end
+			return a.at < b.at
+		end)
+		local item = s.queue[1]
+		if item.at > limit then
+			return false
+		end
+		table.remove(s.queue, 1)
+		if item.at > s.t then
+			s.t = item.at
+		end
+		local ok, wake = coroutine.resume(item.co)
+		if not ok then
+			error("scheduled coroutine failed: " .. tostring(wake))
+		end
+		if coroutine.status(item.co) ~= "dead" then
+			s.seq += 1
+			table.insert(s.queue, { at = wake, seq = s.seq, co = item.co })
+		end
+		return true
+	end
+	-- Runs until virtual time would pass `untilTime` (then sets the clock to it), or, without a limit, until nothing is
+	-- queued in the next Fakes.SETTLE seconds.
 	function s.run(untilTime)
-		while #s.queue > 0 do
-			table.sort(s.queue, function(a, b)
-				if a.at == b.at then
-					return a.seq < b.seq
-				end
-				return a.at < b.at
-			end)
-			local item = s.queue[1]
-			if untilTime ~= nil and item.at > untilTime then
-				s.t = untilTime
-				return
-			end
-			table.remove(s.queue, 1)
-			if item.at > s.t then
-				s.t = item.at
-			end
-			local ok, wake = coroutine.resume(item.co)
-			if not ok then
-				error("scheduled coroutine failed: " .. tostring(wake))
-			end
-			if coroutine.status(item.co) ~= "dead" then
-				s.seq += 1
-				table.insert(s.queue, { at = wake, seq = s.seq, co = item.co })
-			end
+		local limit = if untilTime ~= nil then untilTime else s.t + Fakes.SETTLE
+		while s.step(limit) do
 		end
 		if untilTime ~= nil and untilTime > s.t then
 			s.t = untilTime
@@ -104,9 +116,9 @@ end
 
 -- An HttpService whose JSON is a registry of tables (the fake never needs real JSON text) and whose network is the
 -- `server(url, body, headers, time)` function a test supplies. The server returns { status, headers?, body? } or
--- errors (a timeout).
+-- errors (a timeout). `latency`: virtual seconds each request takes after it is sent.
 function Fakes.httpService(scheduler, server)
-	local service = { registry = {}, n = 0, requests = {} }
+	local service = { registry = {}, n = 0, requests = {}, latency = 0 }
 	local function encode(value)
 		service.n += 1
 		local key = "json#" .. service.n
@@ -126,7 +138,11 @@ function Fakes.httpService(scheduler, server)
 	function service:RequestAsync(request)
 		local body = service.registry[request.Body]
 		table.insert(service.requests, { url = request.Url, body = body, headers = request.Headers, at = scheduler.t })
-		local answer = server(request.Url, body, request.Headers, scheduler.t)
+		local sentAt = scheduler.t
+		if service.latency > 0 then
+			scheduler.sleep(service.latency)
+		end
+		local answer = server(request.Url, body, request.Headers, sentAt)
 		local status = answer.status
 		return {
 			Success = status >= 200 and status < 300,
@@ -149,7 +165,7 @@ function Fakes.okServer()
 	end
 end
 
--- A full runtime over the fakes. options: server, universeId, placeId, secretMissing, httpEnabled.
+-- A full runtime over the fakes. options: server, universeId, placeId, jobId ("" is Studio), secretMissing, httpEnabled.
 function Fakes.runtime(options)
 	options = options or {}
 	local scheduler = Fakes.scheduler()
@@ -197,6 +213,9 @@ function Fakes.runtime(options)
 			return options.placeId or 222
 		end,
 		jobId = function()
+			if options.jobId ~= nil then
+				return options.jobId
+			end
 			return "job-1"
 		end,
 		generateId = function()
@@ -223,10 +242,20 @@ function Fakes.runtime(options)
 				callback(userId, launchData)
 			end
 		end,
+		-- Roblox runs each BindToClose callback in its own thread and shuts down after 30 seconds at most. Runs the
+		-- scheduler until every callback has returned (or 30 virtual seconds passed) and answers the seconds it took.
 		close = function()
+			local started = scheduler.t
+			local pending = #closers
 			for _, callback in closers do
-				callback()
+				scheduler.spawn(function()
+					callback()
+					pending -= 1
+				end)
 			end
+			while pending > 0 and scheduler.step(started + 30) do
+			end
+			return scheduler.t - started
 		end,
 	}
 end
@@ -259,4 +288,5 @@ end
 
 Fakes.Engine = Engine
 Fakes.Wire = Wire
+Fakes.Client = Client
 return Fakes

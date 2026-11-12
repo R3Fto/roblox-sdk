@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0 - 2026-11-11
+
+- Server signal: after `R3FTO.start`, each game server sends `started` once, `alive` every hour and `closing` when it
+  shuts down (waiting at most 5 seconds), with this server's receipt counts by durability. It runs in its own thread,
+  is never retried and never affects purchases. In Studio the server uses an id made for the session.
+- `R3FTO.getDiagnostics()` adds `heartbeat` (the latest signal's kind, send time and result).
+- Source comments use plain words.
+
 ## 0.1.0 - 2026-11-11
 
 First public release.

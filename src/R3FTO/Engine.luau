@@ -5,20 +5,20 @@
 -- same code runs on a game server (task.defer / task.wait / os.clock) and in the plain-Luau tests (a virtual clock).
 --
 -- One job per stable key (a PurchaseId, or a referral observation). A job has one or more channels, for a receipt the
--- DataStore copy ("storage") and the direct R3FTO delivery ("delivery"). Report K-46:
+-- DataStore copy ("storage") and the direct R3FTO delivery ("delivery"). The retry schedule:
 --   * every channel makes its first attempt immediately, and retries at 60, 180 and 300 seconds after THAT channel's
 --     first attempt (offsets from the start, not delays added to each other), at most four attempts in total;
 --   * a channel that succeeds stops; the other channel keeps its own remaining attempts;
 --   * a repeated submit for the same key never restarts the schedule and never starts a second, parallel sequence;
 --   * a Retry-After answer only ever SKIPS scheduled slots that come too early, so it can never add an attempt.
 -- The first channel's first attempt runs before the other channels start, so a durable record that already exists in
--- the DataStore (written earlier by another server) is adopted before anything is sent to R3FTO (K-43: the first
--- observation time never changes).
+-- the DataStore (written earlier by another server) is adopted before anything is sent to R3FTO (the first observation
+-- time never changes).
 
 local Engine = {}
 Engine.__index = Engine
 
--- K-46: attempt offsets in seconds from a channel's first attempt.
+-- The retry schedule: attempt offsets in seconds from a channel's first attempt.
 Engine.OFFSETS = table.freeze({ 0, 60, 180, 300 })
 
 export type AttemptResult = {
@@ -229,7 +229,7 @@ function Engine:jobs(): { [string]: Job }
 	return self._jobs
 end
 
--- The overall durability of a receipt job (plan §1c):
+-- The overall durability of a receipt job:
 --   delivered                 R3FTO acknowledged it after its PostgreSQL commit
 --   stored_awaiting_delivery  the DataStore copy exists; R3FTO has not acknowledged (yet); API recovery can read it later
 --   memory_only               no durable copy yet; attempts remain

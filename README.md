@@ -1,4 +1,4 @@
-# R3FTO Roblox SDK (server, Luau) · 0.1.0
+# R3FTO Roblox SDK (server, Luau) · 0.2.0
 
 A server-only Luau package. It reports **developer-product receipts** and **R3FTO creator-link references** from a
 Roblox game server to R3FTO. It observes evidence. It never grants a product, never decides a purchase and never
@@ -23,7 +23,7 @@ must not reach players' devices).
 ```toml
 # wally.toml
 [server-dependencies]
-R3FTO = "mrcha0s/r3fto-roblox-sdk@0.1.0"
+R3FTO = "mrcha0s/r3fto-roblox-sdk@0.2.0"
 ```
 
 Run `wally install`, map `ServerPackages` into ServerScriptService in your Rojo project, then use this line in place of
@@ -37,7 +37,7 @@ local R3FTO = require(game:GetService("ServerScriptService").ServerPackages.R3FT
 
 ```bash
 git submodule add https://github.com/R3Fto/roblox-sdk.git vendor/r3fto-roblox-sdk
-git -C vendor/r3fto-roblox-sdk checkout v0.1.0
+git -C vendor/r3fto-roblox-sdk checkout v0.2.0
 ```
 
 ```json
@@ -130,6 +130,22 @@ Per channel: `state` is `pending`, `in_progress`, `retry_scheduled`, `succeeded`
 `rejected`. `lastError` is `storage_failed`, `transport_failed`, `ambiguous` (a timeout: R3FTO may or may not have it;
 the same PurchaseId is retried), `throttled` or `rejected`.
 
+## Server signal
+
+After `start`, each game server tells R3FTO that it runs the SDK, so your Roblox page can show your servers and any
+receipts they could not save.
+
+- **When.** `started` once after `start`, `alive` every hour, and `closing` once when the server shuts down (from
+  `game:BindToClose`, waiting at most 5 seconds).
+- **What.** The environment, universe, place, server JobId (in Studio, an id made for the session), SDK version, the
+  signal kind, the send time and this server's receipt counts by durability (`memory_only`,
+  `stored_awaiting_delivery`, `not_durable`). No PlayerId and nothing about players.
+- **How.** `POST {apiBaseUrl}/v1/roblox-sdk/heartbeats` with the same token. A signal runs in its own thread, never
+  inside your receipt handler. A failed signal is not retried; the next one follows on schedule. If R3FTO refuses it
+  (for example a wrong token or environment), one warning is printed per server.
+- **Never affects purchases.** The signal never changes a receipt, a purchase decision or anything R3FTO records about
+  purchases. `getDiagnostics().heartbeat` shows the latest signal's kind, send time and result.
+
 ## Limits you should know
 
 - **Your game server is the source.** Receipts and DataStore records come from your own game server. They are not
@@ -151,7 +167,7 @@ Roblox ids and Robux amounts are decimal strings. Times are ISO 8601 UTC with mi
 
 ```json
 POST /v1/roblox-sdk/receipts
-{ "environment": "test", "universe_id": "123", "place_id": "456", "server_job_id": "…", "sdk_version": "0.1.0",
+{ "environment": "test", "universe_id": "123", "place_id": "456", "server_job_id": "…", "sdk_version": "0.2.0",
   "simulated": false,
   "receipt": { "purchase_id": "…", "player_id": "1", "product_id": "2", "currency_spent": "200",
                "currency_type": "Robux", "place_id_where_purchased": "456", "purchase_channel": null },
@@ -163,6 +179,12 @@ POST /v1/roblox-sdk/referral-observations
 { "environment", "universe_id", "place_id", "server_job_id", "sdk_version",
   "roblox_user_id": "1", "launch_reference": "rt_…", "observed_at": "…Z" }
 → 200 { "outcome": "recorded" | "already_recorded" | "unrecognized_reference" }
+
+POST /v1/roblox-sdk/heartbeats
+{ "environment", "universe_id", "place_id", "server_job_id", "sdk_version",
+  "kind": "started" | "alive" | "closing", "sent_at": "…Z",
+  "receipts": { "memory_only": 0, "stored_awaiting_delivery": 0, "not_durable": 0 } }
+→ 200 { "outcome": "recorded" }
 ```
 
 Errors use the standard R3FTO error body. Codes:
@@ -184,7 +206,8 @@ DataStore value (schema 1):
   - retry offsets, a channel stopping after it succeeds, Retry-After and rejection;
   - duplicate callbacks, the immutable and adopted first observation time;
   - independent DataStore and transport failures, the no-I/O handler call;
-  - the pre-start queue, environment scopes, simulation marking, the LaunchData reference and log hygiene.
+  - the pre-start queue, environment scopes, simulation marking, the LaunchData reference and log hygiene;
+  - the server signal: its hourly schedule, no retry, the counts, the closing wait limit and the Studio id.
 - CI runs these tests on every push and builds `R3FTO.rbxm` and `R3FTO-Example.rbxl` with Rojo.
 - To check your own integration end to end, run the example (`examples/minimal-developer-product/README.md`) in a
   published Test experience.

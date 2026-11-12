@@ -18,7 +18,7 @@ export type AttemptResult = {
 	facts: { [string]: any }?,
 }
 
--- The DataStore copy of a receipt (report K-44/K-45).
+-- The DataStore copy of a receipt: a durable record of it on Roblox's side that keeps the first observation time.
 --
 -- UpdateAsync with a transform that ONLY looks at the current value: when a schema-1 record for this PurchaseId already
 -- exists (written by this server earlier, or by another server that saw the same receipt) the transform returns nil,

@@ -95,7 +95,7 @@ test("HTTP classification", function()
 	eq(Wire.classifyHttp(403, {}, nil).retryable, false)
 end)
 
--- Schedule (K-46) ----------------------------------------------------------------------------------------------------
+-- Retry schedule -----------------------------------------------------------------------------------------------------
 
 test("a failing channel is attempted at 0, 60, 180 and 300 seconds, then stops", function()
 	local f = Fakes.runtime({ server = failing(503) })
@@ -115,7 +115,10 @@ end)
 test("a channel that succeeds stops; the other keeps its own schedule", function()
 	local calls = 0
 	local f = Fakes.runtime({
-		server = function()
+		server = function(url)
+			if string.sub(url, -#Wire.RECEIPTS_PATH) ~= Wire.RECEIPTS_PATH then
+				return { status = 200, body = { outcome = "recorded" } }
+			end
 			calls += 1
 			if calls == 1 then
 				return { status = 500 }
@@ -172,7 +175,7 @@ test("a rejected request (401) is not retried", function()
 	eq(status.durability, "stored_awaiting_delivery")
 end)
 
--- Identity, duplicates, first observation (K-43/K-45) ----------------------------------------------------------------
+-- Identity, duplicates, first observation ----------------------------------------------------------------------------
 
 test("duplicate callbacks join the running work and never restart the schedule", function()
 	local f = Fakes.runtime({ server = failing(500) })
@@ -264,7 +267,10 @@ end)
 test("a timeout is ambiguous and retried with the same PurchaseId and time", function()
 	local calls = 0
 	local f = Fakes.runtime({
-		server = function()
+		server = function(url)
+			if string.sub(url, -#Wire.RECEIPTS_PATH) ~= Wire.RECEIPTS_PATH then
+				return { status = 200, body = { outcome = "recorded" } }
+			end
 			calls += 1
 			if calls == 1 then
 				error("HttpError: Timedout")
@@ -300,7 +306,7 @@ test("observeReceipt does no I/O and never yields inside the publisher's handler
 	eq(#f.http.requests, 0, "no request before the handler returned")
 	eq(f.dataStores.calls, 0, "no DataStore call before the handler returned")
 	f.scheduler.run()
-	eq(#f.http.requests, 1)
+	eq(#Fakes.requestsTo(f.http, Wire.RECEIPTS_PATH), 1)
 end)
 
 test("an R3FTO failure never changes the publisher's decision; bad input never throws", function()
@@ -413,6 +419,246 @@ test("diagnostics never contain a PlayerId or the token", function()
 	end
 	local diagnostics = f.client:getDiagnostics()
 	eq(diagnostics.receipts.delivered, 1)
+end)
+
+-- Server signal ------------------------------------------------------------------------------------------------------
+
+local Client = Fakes.Client
+local HOUR = Client.HEARTBEAT_INTERVAL
+
+local function signals(f)
+	return Fakes.requestsTo(f.http, Wire.HEARTBEATS_PATH)
+end
+
+local function kinds(requests)
+	local list = {}
+	for _, request in requests do
+		table.insert(list, request.body.kind)
+	end
+	return table.concat(list, ",")
+end
+
+local function count(logs, level, text)
+	local found = 0
+	for _, line in logs do
+		if line.level == level and string.find(line.message, text, 1, true) then
+			found += 1
+		end
+	end
+	return found
+end
+
+-- Every string anywhere in a value, so a test can look for a value no matter where it is.
+local function strings(value, into)
+	into = into or {}
+	if type(value) == "table" then
+		for key, item in value do
+			strings(key, into)
+			strings(item, into)
+		end
+	elseif value ~= nil then
+		table.insert(into, tostring(value))
+	end
+	return into
+end
+
+test("heartbeatBody carries integration data only", function()
+	local body = Wire.heartbeatBody("alive", "2025-11-11T10:30:45.123Z", { memory_only = 1, stored_awaiting_delivery = 2, not_durable = 3 }, {
+		environment = "test", universeId = "111", placeId = "222", serverJobId = "job-1", sdkVersion = "0.2.0",
+	}, "job-1")
+	local names = {}
+	for name in body do
+		table.insert(names, name)
+	end
+	table.sort(names)
+	eq(table.concat(names, ","), "environment,kind,place_id,receipts,sdk_version,sent_at,server_job_id,universe_id")
+	eq(body.kind, "alive")
+	eq(body.sent_at, "2025-11-11T10:30:45.123Z")
+	eq(body.receipts.memory_only, 1)
+	eq(body.receipts.stored_awaiting_delivery, 2)
+	eq(body.receipts.not_durable, 3)
+	eq(Wire.HEARTBEATS_PATH, "/v1/roblox-sdk/heartbeats")
+end)
+
+test("started is sent once after start and alive exactly every hour after it", function()
+	local f = Fakes.runtime()
+	f.scheduler.run(10)
+	eq(#signals(f), 0, "nothing before start")
+	assert(f.client:start({ environment = "production" }))
+	f.scheduler.run(10 + 3 * HOUR + 1)
+	local sent = signals(f)
+	eq(kinds(sent), "started,alive,alive,alive")
+	eq(times(sent), table.concat({ 10, 10 + HOUR, 10 + 2 * HOUR, 10 + 3 * HOUR }, ","), "hourly from start, no drift")
+	local first = sent[1].body
+	eq(first.environment, "production")
+	eq(first.universe_id, "111")
+	eq(first.place_id, "222")
+	eq(first.server_job_id, "job-1")
+	eq(first.sdk_version, "0.1.0-test")
+	eq(first.sent_at, Wire.isoUtcFromMillis(Fakes.BASE_MILLIS + 10 * 1000), "sent_at from the Unix clock")
+	eq(sent[2].body.sent_at, Wire.isoUtcFromMillis(Fakes.BASE_MILLIS + (10 + HOUR) * 1000))
+	eq(sent[1].headers.Authorization, "Bearer <secret>", "the same token as the receipts")
+	local diagnostics = f.client:getDiagnostics()
+	eq(diagnostics.heartbeat.lastKind, "alive")
+	eq(diagnostics.heartbeat.lastSentAtUtc, sent[4].body.sent_at)
+	eq(diagnostics.heartbeat.lastResult, "recorded")
+end)
+
+test("a failed signal is not retried and the next one follows on schedule", function()
+	local f = Fakes.runtime({
+		server = function(url)
+			if string.sub(url, -#Wire.HEARTBEATS_PATH) == Wire.HEARTBEATS_PATH then
+				return { status = 503 }
+			end
+			return { status = 200, body = { outcome = "recorded" } }
+		end,
+	})
+	assert(f.client:start({ environment = "production" }))
+	f.scheduler.run(2 * HOUR + 1)
+	eq(times(signals(f)), table.concat({ 0, HOUR, 2 * HOUR }, ","), "one attempt per signal")
+	eq(f.client:getDiagnostics().heartbeat.lastResult, "transport_failed")
+	eq(count(f.logs, "warn", "server signal"), 0, "a failed signal is an info line")
+	eq(count(f.logs, "info", "server signal alive failed"), 2)
+end)
+
+test("a refused signal warns once per server", function()
+	local f = Fakes.runtime({ server = failing(401) })
+	assert(f.client:start({ environment = "production" }))
+	f.scheduler.run(2 * HOUR + 1)
+	eq(#signals(f), 3, "still one signal per hour")
+	eq(count(f.logs, "warn", "R3FTO refused the server signal (HTTP 401 X)"), 1)
+	eq(f.client:getDiagnostics().heartbeat.lastResult, "rejected")
+end)
+
+test("signals carry this server's receipt counts by durability and no PlayerId", function()
+	local longId = function(n)
+		return "long-purchase-id-that-no-datastore-key-can-hold-000000000" .. n -- over 50 characters: no DataStore copy
+	end
+	local f = Fakes.runtime({
+		server = function(url, body)
+			if string.sub(url, -#Wire.RECEIPTS_PATH) ~= Wire.RECEIPTS_PATH then
+				return { status = 200, body = { outcome = "recorded" } }
+			end
+			local id = body.receipt.purchase_id
+			if id == "a1b2c3d4-0000-4000-8000-000000000001" then
+				return { status = 401, body = { error = { code = "X" } } } -- refused: the DataStore copy remains
+			elseif id == "a1b2c3d4-0000-4000-8000-000000000002" then
+				return { status = 200, body = { outcome = "recorded" } } -- delivered: not counted
+			end
+			return { status = 500 } -- the long ids: no copy and no delivery
+		end,
+	})
+	assert(f.client:start({ environment = "production" }))
+	f.client:observeReceipt(Fakes.receipt())
+	f.client:observeReceipt(Fakes.receipt({ PurchaseId = "a1b2c3d4-0000-4000-8000-000000000002" }))
+	f.client:observeReceipt(Fakes.receipt({ PurchaseId = longId(3) }))
+	f.scheduler.run(HOUR - 100)
+	f.client:observeReceipt(Fakes.receipt({ PurchaseId = longId(4) })) -- still has attempts left at the hour
+	f.scheduler.run(HOUR + 1)
+	local alive = signals(f)[2]
+	eq(alive.body.kind, "alive")
+	eq(alive.body.receipts.memory_only, 1, "attempts remain")
+	eq(alive.body.receipts.stored_awaiting_delivery, 1, "copy kept, delivery refused")
+	eq(alive.body.receipts.not_durable, 1, "every attempt ended without a copy")
+	for _, request in signals(f) do
+		eq(request.body.player_id, nil, "no player_id member")
+		for _, text in strings(request.body) do
+			assert(not string.find(text, "1234567", 1, true), "a PlayerId in a signal")
+		end
+	end
+end)
+
+test("a signal is never an Engine job and never counts as a receipt or a referral", function()
+	local f = Fakes.runtime()
+	assert(f.client:start({ environment = "production" }))
+	f.scheduler.run(2 * HOUR + 1)
+	eq(#signals(f), 3)
+	eq(next(f.client._engine:jobs()), nil, "no Engine job")
+	local diagnostics = f.client:getDiagnostics()
+	eq(diagnostics.referralObservations, 0)
+	eq(diagnostics.receipts.delivered + diagnostics.receipts.memory_only + diagnostics.receipts.not_durable + diagnostics.receipts.stored_awaiting_delivery, 0)
+end)
+
+test("the receipt handler never waits for a signal", function()
+	local f = Fakes.runtime()
+	f.http.latency = 20
+	assert(f.client:start({ environment = "production" }))
+	f.scheduler.run(1)
+	eq(#signals(f), 1, "started is in flight")
+	eq(f.client:getDiagnostics().heartbeat.lastResult, "sending")
+	-- A publisher handler called outside any scheduled coroutine: a yield here would error.
+	local function processReceipt(receiptInfo)
+		f.client:observeReceipt(receiptInfo)
+		return "PurchaseGranted"
+	end
+	eq(processReceipt(Fakes.receipt()), "PurchaseGranted")
+	f.scheduler.run(2)
+	local delivery = Fakes.requestsTo(f.http, Wire.RECEIPTS_PATH)
+	eq(#delivery, 1)
+	eq(delivery[1].at, 1, "the receipt went out while the signal was still waiting")
+	eq(f.client:getDiagnostics().heartbeat.lastResult, "sending")
+end)
+
+test("closing is sent on close and signals stop after it", function()
+	local f = Fakes.runtime()
+	assert(f.client:start({ environment = "production" }))
+	f.scheduler.run(100)
+	local waited = f.close()
+	assert(waited < Client.CLOSING_WAIT_LIMIT, "a fast closing signal ends the wait at once")
+	eq(kinds(signals(f)), "started,closing")
+	eq(signals(f)[2].at, 100)
+	f.scheduler.run(5 * HOUR)
+	eq(kinds(signals(f)), "started,closing", "no alive after close")
+	f.close()
+	eq(#signals(f), 2, "closing is sent once")
+end)
+
+test("shutdown waits for the closing signal at most the wait limit, well under 30 seconds", function()
+	local f = Fakes.runtime()
+	assert(f.client:start({ environment = "production" }))
+	f.scheduler.run(100)
+	f.http.latency = 60 -- R3FTO does not answer in time
+	local waited = f.close()
+	assert(Client.CLOSING_WAIT_LIMIT <= 10, "the limit stays well under Roblox's 30 seconds")
+	eq(waited, Client.CLOSING_WAIT_LIMIT)
+	eq(kinds(signals(f)), "started,closing", "one attempt, not retried")
+	eq(f.client:getDiagnostics().heartbeat.lastResult, "sending")
+end)
+
+test("a closing signal with no answer is not retried and no receipt work is added", function()
+	local f = Fakes.runtime({ server = failing(500) })
+	assert(f.client:start({ environment = "production" }))
+	f.client:observeReceipt(Fakes.receipt())
+	f.scheduler.run(30)
+	f.close()
+	f.scheduler.run()
+	eq(kinds(signals(f)), "started,closing")
+	eq(times(Fakes.requestsTo(f.http, Wire.RECEIPTS_PATH)), "0,60,180,300", "the receipt keeps its own schedule")
+end)
+
+test("Studio (empty JobId) signals with one studio-<GUID> id per session; receipts are unchanged", function()
+	local f = Fakes.runtime({ jobId = "" })
+	assert(f.client:start({ environment = "test" }))
+	f.client:observeReceipt(Fakes.receipt())
+	f.scheduler.run(HOUR + 1)
+	local sent = signals(f)
+	eq(#sent, 2)
+	eq(sent[1].body.server_job_id, "studio-00000000-0000-0000-0000-000000000001")
+	eq(sent[2].body.server_job_id, sent[1].body.server_job_id, "the same id for the whole session")
+	eq(Fakes.requestsTo(f.http, Wire.RECEIPTS_PATH)[1].body.server_job_id, "", "the receipt wire is unchanged")
+end)
+
+test("signal logs never contain the token, a PlayerId or the server job id", function()
+	local f = Fakes.runtime({ server = failing(503) })
+	assert(f.client:start({ environment = "production" }))
+	f.client:observeReceipt(Fakes.receipt())
+	f.scheduler.run(HOUR + 1)
+	f.close()
+	for _, line in f.logs do
+		assert(not string.find(line.message, "job-1", 1, true), "a job id in a log line")
+		assert(not string.find(line.message, "<secret>", 1, true), "the token in a log line")
+		assert(not string.find(line.message, "1234567", 1, true), "a PlayerId in a log line")
+	end
 end)
 
 -- Runner ---------------------------------------------------------------------------------------------------------------

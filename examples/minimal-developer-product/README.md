@@ -63,7 +63,7 @@ receive.
 
 Press **Play** in Studio (server and client).
 
-- **Start.** The Output shows `[R3FTO] started for test (SDK 0.1.0)`. Any setup problem prints a `[R3FTO]` warning that
+- **Start.** The Output shows `[R3FTO] started for test (SDK 0.2.0)`. Any setup problem prints a `[R3FTO]` warning that
   names it: HTTP off, secret missing, or the place not published.
 - **Simulated receipt and duplicate** (`R3FTOTestDemos`, Test only). Expected output:
   - `[R3FTO] receipt r3fto-sim-example-…: DataStore copy written`
