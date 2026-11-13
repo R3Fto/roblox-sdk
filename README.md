@@ -1,4 +1,4 @@
-# R3FTO Roblox SDK (server, Luau) · 0.2.0
+# R3FTO Roblox SDK (server, Luau) · 0.2.1
 
 A server-only Luau package. It reports **developer-product receipts** and **R3FTO creator-link references** from a
 Roblox game server to R3FTO. It observes evidence. It never grants a product, never decides a purchase and never
@@ -16,14 +16,12 @@ must not reach players' devices).
 1. Download `R3FTO.rbxm` from the [latest release](https://github.com/R3Fto/roblox-sdk/releases/latest).
 2. In Studio, drag the file onto **ServerScriptService** in the Explorer.
 
-`R3FTO-Example.rbxl` in the same release is the example game, ready to open.
-
 ### B. Rojo with Wally
 
 ```toml
 # wally.toml
 [server-dependencies]
-R3FTO = "mrcha0s/r3fto-roblox-sdk@0.2.0"
+R3FTO = "mrcha0s/r3fto-roblox-sdk@0.2.1"
 ```
 
 Run `wally install`, map `ServerPackages` into ServerScriptService in your Rojo project, then use this line in place of
@@ -37,7 +35,7 @@ local R3FTO = require(game:GetService("ServerScriptService").ServerPackages.R3FT
 
 ```bash
 git submodule add https://github.com/R3Fto/roblox-sdk.git vendor/r3fto-roblox-sdk
-git -C vendor/r3fto-roblox-sdk checkout v0.2.0
+git -C vendor/r3fto-roblox-sdk checkout v0.2.1
 ```
 
 ```json
@@ -64,8 +62,9 @@ ServerScriptService
 ### Then, for every install
 
 - Turn on **Allow HTTP Requests** (Experience Settings › Security).
-- Store the SDK token R3FTO gives you as the secret `R3FTO_SDK_TOKEN` with domain `r3f.to`: Creator Hub › Secrets for
-  live servers, and Experience Settings › Security › **Local Secrets** for Studio.
+- Store the SDK token from your game's Roblox tab on R3FTO (one for Test, one for Production; show or copy it there) as the
+  secret `R3FTO_SDK_TOKEN` with domain `r3f.to`: Creator Hub › Secrets for live servers, and Experience Settings ›
+  Security › **Local Secrets** for Studio.
 
 A working game is in `examples/minimal-developer-product/`.
 
@@ -128,7 +127,8 @@ Durability (`getReceiptStatus(...).durability`):
 
 Per channel: `state` is `pending`, `in_progress`, `retry_scheduled`, `succeeded`, `failed` (all attempts used) or
 `rejected`. `lastError` is `storage_failed`, `transport_failed`, `ambiguous` (a timeout: R3FTO may or may not have it;
-the same PurchaseId is retried), `throttled` or `rejected`.
+the same PurchaseId is retried), `throttled`, `rejected` or `not_configured` (the SDK token secret is not available on
+this server, so nothing was sent).
 
 ## Server signal
 
@@ -142,7 +142,9 @@ receipts they could not save.
   `stored_awaiting_delivery`, `not_durable`). No PlayerId and nothing about players.
 - **How.** `POST {apiBaseUrl}/v1/roblox-sdk/heartbeats` with the same token. A signal runs in its own thread, never
   inside your receipt handler. A failed signal is not retried; the next one follows on schedule. If R3FTO refuses it
-  (for example a wrong token or environment), one warning is printed per server.
+  (for example a wrong token or environment), one warning is printed per server. If the SDK token secret is not
+  available on the server, nothing is sent and one warning per server says so (`server signals are not sent`); the
+  warning at start names the secret and gives Roblox's own message.
 - **Never affects purchases.** The signal never changes a receipt, a purchase decision or anything R3FTO records about
   purchases. `getDiagnostics().heartbeat` shows the latest signal's kind, send time and result.
 
@@ -167,7 +169,7 @@ Roblox ids and Robux amounts are decimal strings. Times are ISO 8601 UTC with mi
 
 ```json
 POST /v1/roblox-sdk/receipts
-{ "environment": "test", "universe_id": "123", "place_id": "456", "server_job_id": "…", "sdk_version": "0.2.0",
+{ "environment": "test", "universe_id": "123", "place_id": "456", "server_job_id": "…", "sdk_version": "0.2.1",
   "simulated": false,
   "receipt": { "purchase_id": "…", "player_id": "1", "product_id": "2", "currency_spent": "200",
                "currency_type": "Robux", "place_id_where_purchased": "456", "purchase_channel": null },
@@ -208,6 +210,6 @@ DataStore value (schema 1):
   - independent DataStore and transport failures, the no-I/O handler call;
   - the pre-start queue, environment scopes, simulation marking, the LaunchData reference and log hygiene;
   - the server signal: its hourly schedule, no retry, the counts, the closing wait limit and the Studio id.
-- CI runs these tests on every push and builds `R3FTO.rbxm` and `R3FTO-Example.rbxl` with Rojo.
-- To check your own integration end to end, run the example (`examples/minimal-developer-product/README.md`) in a
-  published Test experience.
+- CI runs these tests on every push, builds `R3FTO.rbxm` with Rojo and checks that the example place builds.
+- To check your own integration end to end, use your R3FTO Test token in a published Test experience, then look at
+  Last SDK signal on your game's Roblox tab.

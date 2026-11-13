@@ -72,12 +72,34 @@ function Adapters.dataStoreChannel(dataStoreService: any, environment: string, W
 	end
 end
 
+-- The longest part of Roblox's own error text kept when a secret cannot be read.
+Adapters.MAX_SECRET_ERROR = 200
+
+-- The bearer authorization header value from a Roblox Secret: HttpService:GetSecret(secretName):AddPrefix("Bearer ").
+-- Answers (value, nil), or (nil, Roblox's own error text) when the secret cannot be read. The text is Roblox's lookup
+-- error (for example "Can't find secret with given key") without a leading script position, at most MAX_SECRET_ERROR
+-- characters long. It never holds the secret: a script cannot read a Secret's content.
+function Adapters.secretAuthorization(httpService: any, secretName: string): (any?, string?)
+	local ok, value = pcall(function()
+		return httpService:GetSecret(secretName):AddPrefix("Bearer ")
+	end)
+	if ok then
+		return value, nil
+	end
+	local message = string.gsub(tostring(value), "^[^:]+:%d+:%s*", "", 1)
+	if #message > Adapters.MAX_SECRET_ERROR then
+		message = string.sub(message, 1, Adapters.MAX_SECRET_ERROR)
+	end
+	return nil, message
+end
+
 -- A POST to R3FTO with the bearer token. `authorization` is a Roblox Secret (HttpService:GetSecret(...):AddPrefix(
 -- "Bearer ")): the plaintext is never readable by any script, and Roblox only lets it travel in a header or the URL.
+-- Without it nothing is sent: the request never leaves the server, so the answer is "not_configured", not a refusal.
 function Adapters.httpPoster(httpService: any, baseUrl: string, authorization: any, Wire: any)
 	return function(path: string, body: any): AttemptResult
 		if authorization == nil then
-			return { ok = false, kind = "rejected", retryable = false, detail = "the R3FTO SDK token secret is not available" }
+			return { ok = false, kind = "not_configured", retryable = false, detail = "the SDK token secret is not available" }
 		end
 
 		local encodedOk, encoded = pcall(function()

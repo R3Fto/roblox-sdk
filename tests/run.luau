@@ -464,7 +464,7 @@ end
 
 test("heartbeatBody carries integration data only", function()
 	local body = Wire.heartbeatBody("alive", "2025-11-11T10:30:45.123Z", { memory_only = 1, stored_awaiting_delivery = 2, not_durable = 3 }, {
-		environment = "test", universeId = "111", placeId = "222", serverJobId = "job-1", sdkVersion = "0.2.0",
+		environment = "test", universeId = "111", placeId = "222", serverJobId = "job-1", sdkVersion = "0.2.1",
 	}, "job-1")
 	local names = {}
 	for name in body do
@@ -658,6 +658,111 @@ test("signal logs never contain the token, a PlayerId or the server job id", fun
 		assert(not string.find(line.message, "job-1", 1, true), "a job id in a log line")
 		assert(not string.find(line.message, "<secret>", 1, true), "the token in a log line")
 		assert(not string.find(line.message, "1234567", 1, true), "a PlayerId in a log line")
+	end
+end)
+
+-- The SDK token secret ------------------------------------------------------------------------------------------------
+
+local Adapters = Fakes.Adapters
+local SECRET = Client.DEFAULT_TOKEN_SECRET
+local NOT_CONFIGURED_WARNING = "server signals are not sent: the SDK token secret is not available (see the warning at start). Receipts keep only their DataStore copy until the secret is added"
+
+test("secretAuthorization answers the header value, or Roblox's own error without a script position, capped", function()
+	local http = Fakes.httpService(Fakes.scheduler(), Fakes.okServer())
+	local value, why = Adapters.secretAuthorization(http, SECRET)
+	eq(value, nil, "missing secret")
+	eq(why, "Can't find secret with given key", "Roblox's message as raised")
+
+	http.secretError = "Workspace.Script:12: Can't find secret with given key"
+	eq(select(2, Adapters.secretAuthorization(http, SECRET)), "Can't find secret with given key", "position stripped")
+
+	http.secretError = "HTTP 403: Forbidden"
+	eq(select(2, Adapters.secretAuthorization(http, SECRET)), "HTTP 403: Forbidden", "not a script position: kept")
+
+	http.secretError = string.rep("x", 300)
+	eq(select(2, Adapters.secretAuthorization(http, SECRET)), string.rep("x", Adapters.MAX_SECRET_ERROR), "capped")
+	eq(Adapters.MAX_SECRET_ERROR, 200)
+
+	http.secretError = "ServerScriptService.R3FTOStart:7: " .. string.rep("y", 250)
+	eq(select(2, Adapters.secretAuthorization(http, SECRET)), string.rep("y", 200), "stripped, then capped")
+
+	http.secrets[SECRET] = "tok-7Qx"
+	local found, none = Adapters.secretAuthorization(http, SECRET)
+	eq(found, "Bearer tok-7Qx", "the header value")
+	eq(none, nil, "no reason on success")
+end)
+
+test("a missing secret puts Roblox's own message into the start problem", function()
+	local f = Fakes.runtime({ secretMissing = true, secretError = "Workspace.Script:12: Can't find secret with given key" })
+	eq((f.client:start({ environment = "test" })), true, "start still succeeds")
+	local expected = "the secret R3FTO_SDK_TOKEN is not available (Roblox: Can't find secret with given key). Add it in Creator Hub Secrets, or as a Studio Local Secret for local tests; direct delivery to R3FTO fails until then"
+	local problems = f.client:getDiagnostics().problems
+	eq(#problems, 1)
+	eq(problems[1], expected)
+	eq(count(f.logs, "warn", expected), 1, "printed once at start")
+end)
+
+test("httpPoster without the secret answers not_configured, not retryable, and sends nothing", function()
+	local http = Fakes.httpService(Fakes.scheduler(), Fakes.okServer())
+	local post = Adapters.httpPoster(http, "https://r3f.to", nil, Wire)
+	local outcome = post(Wire.RECEIPTS_PATH, { any = "body" })
+	eq(outcome.ok, false)
+	eq(outcome.kind, "not_configured")
+	eq(outcome.retryable, false)
+	eq(outcome.detail, "the SDK token secret is not available")
+	eq(#http.requests, 0, "nothing left the server")
+end)
+
+test("without the secret a receipt's delivery ends rejected (not_configured) and its DataStore copy is unaffected", function()
+	local f = Fakes.runtime({ secretMissing = true })
+	assert(f.client:start({ environment = "production" }))
+	local answer = f.client:observeReceipt(Fakes.receipt())
+	eq(answer.accepted, true)
+	f.scheduler.run()
+	local status = assert(f.client:getReceiptStatus(answer.purchaseId))
+	eq(status.channels.delivery.state, "rejected")
+	eq(status.channels.delivery.attempts, 1, "not retried")
+	eq(status.channels.delivery.lastError, "not_configured")
+	eq(status.channels.storage.state, "succeeded")
+	eq(status.channels.storage.attempts, 1)
+	eq(status.durability, "stored_awaiting_delivery")
+	assert(f.dataStores.stores[Wire.DATASTORE_NAME .. "/production"][answer.purchaseId], "the DataStore copy exists")
+	eq(#f.http.requests, 0, "nothing was sent")
+end)
+
+test("without the secret the server signal warns once with its own text and never blames R3FTO", function()
+	local f = Fakes.runtime({ secretMissing = true })
+	assert(f.client:start({ environment = "production" }))
+	f.scheduler.run(2 * HOUR + 1)
+	eq(#signals(f), 0, "no signal left the server")
+	eq(count(f.logs, "warn", NOT_CONFIGURED_WARNING), 1, "warned once")
+	eq(count(f.logs, "warn", "R3FTO refused"), 0, "no refusal warning")
+	eq(count(f.logs, "info", "R3FTO refused"), 0, "no refusal line")
+	eq(count(f.logs, "info", "server signal alive failed (not_configured"), 2, "later signals are info lines")
+	eq(f.client:getDiagnostics().heartbeat.lastResult, "not_configured")
+end)
+
+test("the secret's value never reaches the logs, the problems or the diagnostics", function()
+	local sentinel = "tok-7Qx"
+	for _, server in { Fakes.okServer(), failing(401), failing(503) } do
+		local f = Fakes.runtime({ server = server, secretValue = sentinel, httpEnabled = false, universeId = 0 })
+		assert(f.client:start({ environment = "test" }))
+		local answer = f.client:observeReceipt(Fakes.receipt())
+		f.join(1234567, "rt_abcdefghijklmnopqrstuvwxyz")
+		f.scheduler.run(HOUR + 1)
+		f.close()
+		eq(Fakes.requestsTo(f.http, Wire.RECEIPTS_PATH)[1].headers.Authorization, "Bearer " .. sentinel, "the secret was used")
+		for _, line in f.logs do
+			assert(not string.find(line.message, sentinel, 1, true), "the secret in a log line")
+		end
+		local diagnostics = f.client:getDiagnostics()
+		eq(#diagnostics.problems, 2, "the setup problems are listed")
+		for _, text in strings(diagnostics) do
+			assert(not string.find(text, sentinel, 1, true), "the secret in the diagnostics")
+		end
+		for _, text in strings(f.client:getReceiptStatus(answer.purchaseId)) do
+			assert(not string.find(text, sentinel, 1, true), "the secret in the receipt status")
+		end
 	end
 end)
 

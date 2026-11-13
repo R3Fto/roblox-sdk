@@ -81,6 +81,7 @@ function Client.new(runtime: Runtime)
 	self._closed = false
 	self._signalJobId = nil :: string?
 	self._signalRefusalWarned = false
+	self._signalNotConfiguredWarned = false
 	self._heartbeat = { lastKind = nil :: string?, lastSentAtUtc = nil :: string?, lastResult = nil :: string? }
 	return self
 end
@@ -136,7 +137,7 @@ function Client:start(config: any): (boolean, string?)
 	end
 	local authorization, why = runtime.authorization(secretName)
 	if authorization == nil then
-		table.insert(self._problems, "the secret " .. secretName .. " is not available (" .. tostring(why) .. "), so direct delivery to R3FTO will fail")
+		table.insert(self._problems, "the secret " .. secretName .. " is not available (Roblox: " .. tostring(why) .. "). Add it in Creator Hub Secrets, or as a Studio Local Secret for local tests; direct delivery to R3FTO fails until then")
 	end
 
 	self._post = runtime.poster(baseUrl, authorization)
@@ -207,6 +208,12 @@ function Client:_signal(kind: string)
 		-- A refusal (the token, the environment, the universe or the request) repeats on every signal: say it once.
 		self._signalRefusalWarned = true
 		self:_say("warn", "R3FTO refused the server signal (" .. tostring(outcome.detail) .. "); check the SDK token and the environment. Receipts are not affected")
+		return
+	end
+	if outcome.kind == "not_configured" and not self._signalNotConfiguredWarned then
+		-- The secret is missing on this server, so no signal ever leaves it: say it once (the start warning names the fix).
+		self._signalNotConfiguredWarned = true
+		self:_say("warn", "server signals are not sent: the SDK token secret is not available (see the warning at start). Receipts keep only their DataStore copy until the secret is added")
 		return
 	end
 	self:_say("info", "server signal " .. kind .. " failed (" .. tostring(outcome.kind) .. ", " .. tostring(outcome.detail) .. "); the next one follows on schedule")

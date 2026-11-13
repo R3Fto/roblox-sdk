@@ -25,7 +25,7 @@ export type AttemptResult = {
 	ok: boolean,
 	-- set when ok and the channel found or produced the canonical record (the DataStore copy that already existed)
 	record: any?,
-	-- set when not ok: "storage_failed" | "transport_failed" | "ambiguous" | "throttled" | "rejected"
+	-- set when not ok: "storage_failed" | "transport_failed" | "ambiguous" | "throttled" | "rejected" | "not_configured"
 	kind: string?,
 	retryable: boolean?,
 	retryAfter: number?,

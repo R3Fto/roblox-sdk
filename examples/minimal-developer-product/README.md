@@ -3,9 +3,10 @@
 A tiny experience that sells one developer product ("100 coins"). It reports every receipt to R3FTO with the real SDK in
 `src/R3FTO`. Three ways to open it:
 
-- **Ready-made place:** download `R3FTO-Example.rbxl` from the
-  [latest release](https://github.com/R3Fto/roblox-sdk/releases/latest) and open it in Studio.
-- **Rojo:** `rojo serve examples/minimal-developer-product` from the repository root, then connect from the Rojo plugin.
+- **Rojo, live sync:** `rojo serve examples/minimal-developer-product` from the repository root, then connect from the
+  Rojo plugin.
+- **Rojo, place file:** `rojo build examples/minimal-developer-product -o R3FTO-Example.rbxl` from the repository
+  root, then open `R3FTO-Example.rbxl` in Studio.
 - **By hand:** create the objects below in Studio.
 
 ## What is R3FTO code and what is yours
@@ -51,8 +52,8 @@ receive.
    Studio Access to API Services** for Studio testing.
 3. **Developer product.** Creator Hub › your experience › Monetization › Developer Products › Create. Put its id in
    `DEVELOPER_PRODUCT_ID` in `BuyButton`.
-4. **SDK token.** R3FTO gives you one SDK token per environment (Test and Production are separate). Never paste it into
-   a script.
+4. **SDK token.** R3FTO gives you one SDK token per environment (Test and Production are separate); show or copy it on
+   your game's Roblox tab on R3FTO. Never paste it into a script.
    - For live servers: Creator Hub › your experience › Secrets › Create Secret. Name `R3FTO_SDK_TOKEN`, value the token,
      domain `r3f.to`.
    - For Studio tests: File › Experience Settings › Security › **Local Secrets**, with the same name and domain.
@@ -63,7 +64,7 @@ receive.
 
 Press **Play** in Studio (server and client).
 
-- **Start.** The Output shows `[R3FTO] started for test (SDK 0.2.0)`. Any setup problem prints a `[R3FTO]` warning that
+- **Start.** The Output shows `[R3FTO] started for test (SDK 0.2.1)`. Any setup problem prints a `[R3FTO]` warning that
   names it: HTTP off, secret missing, or the place not published.
 - **Simulated receipt and duplicate** (`R3FTOTestDemos`, Test only). Expected output:
   - `[R3FTO] receipt r3fto-sim-example-…: DataStore copy written`

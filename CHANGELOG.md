@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.1 - 2026-11-13
+
+- The GitHub release carries `R3FTO.rbxm` only. The example game stays as source in
+  `examples/minimal-developer-product`; open it with Rojo (`rojo serve` or `rojo build`).
+- When the SDK token secret cannot be read, the warning at start shows Roblox's own message (for example
+  `Can't find secret with given key`) and how to add the secret.
+- Without the secret, server signals print one warning per server (`server signals are not sent`) instead of saying
+  that R3FTO refused them.
+- Without the secret, a receipt's delivery `lastError` and `getDiagnostics().heartbeat.lastResult` report
+  `not_configured` (before: `rejected`).
+
 ## 0.2.0 - 2026-11-11
 
 - Server signal: after `R3FTO.start`, each game server sends `started` once, `alive` every hour and `closing` when it

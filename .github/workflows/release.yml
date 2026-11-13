@@ -56,7 +56,9 @@ jobs:
             test "${GITHUB_REF_NAME#v}" = "$code"
           fi
 
-      - name: Build R3FTO.rbxm and the example place
+      # The example place is built only to check that it still builds. It is not released:
+      # the release carries the SDK alone, and the example stays as source in this repository.
+      - name: Build R3FTO.rbxm and check the example place
         run: |
           rojo build default.project.json -o R3FTO.rbxm
           rojo build examples/minimal-developer-product -o R3FTO-Example.rbxl
@@ -64,9 +66,7 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: r3fto-roblox-sdk
-          path: |
-            R3FTO.rbxm
-            R3FTO-Example.rbxl
+          path: R3FTO.rbxm
           if-no-files-found: error
 
   release:
@@ -90,5 +90,5 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           awk -v v="$version" '$0 ~ "^## "v" " {on=1; next} /^## / {on=0} on' CHANGELOG.md > notes.md
-          gh release create "$GITHUB_REF_NAME" R3FTO.rbxm R3FTO-Example.rbxl \
+          gh release create "$GITHUB_REF_NAME" R3FTO.rbxm \
             --title "R3FTO Roblox SDK $version" --notes-file notes.md

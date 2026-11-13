@@ -135,6 +135,21 @@ function Fakes.httpService(scheduler, server)
 		end
 		return value
 	end
+	-- Roblox Secrets: `secrets[name]` is the content of a secret; a missing one raises `secretError` (Roblox's lookup error
+	-- by default). The fake Secret's AddPrefix answers a plain string so tests can read the header it produces.
+	service.secrets = {}
+	service.secretError = "Can't find secret with given key"
+	function service:GetSecret(name)
+		local content = service.secrets[name]
+		if content == nil then
+			error(service.secretError, 0)
+		end
+		return {
+			AddPrefix = function(_, prefix)
+				return prefix .. content
+			end,
+		}
+	end
 	function service:RequestAsync(request)
 		local body = service.registry[request.Body]
 		table.insert(service.requests, { url = request.Url, body = body, headers = request.Headers, at = scheduler.t })
@@ -165,12 +180,19 @@ function Fakes.okServer()
 	end
 end
 
--- A full runtime over the fakes. options: server, universeId, placeId, jobId ("" is Studio), secretMissing, httpEnabled.
+-- A full runtime over the fakes. options: server, universeId, placeId, jobId ("" is Studio), httpEnabled, secretMissing
+-- (the token secret does not exist), secretError (the error GetSecret raises then), secretValue (its content).
 function Fakes.runtime(options)
 	options = options or {}
 	local scheduler = Fakes.scheduler()
 	local dataStores = Fakes.dataStoreService(scheduler)
 	local http = Fakes.httpService(scheduler, options.server or Fakes.okServer())
+	if not options.secretMissing then
+		http.secrets[Client.DEFAULT_TOKEN_SECRET] = options.secretValue or "<secret>"
+	end
+	if options.secretError ~= nil then
+		http.secretError = options.secretError
+	end
 	local logs = {}
 	local players = {}
 	local closers = {}
@@ -194,11 +216,8 @@ function Fakes.runtime(options)
 		httpEnabled = function()
 			return options.httpEnabled ~= false
 		end,
-		authorization = function(_)
-			if options.secretMissing then
-				return nil, "missing"
-			end
-			return "Bearer <secret>", nil
+		authorization = function(secretName)
+			return Adapters.secretAuthorization(http, secretName)
 		end,
 		poster = function(baseUrl, authorization)
 			return Adapters.httpPoster(http, baseUrl, authorization, Wire)
@@ -289,4 +308,5 @@ end
 Fakes.Engine = Engine
 Fakes.Wire = Wire
 Fakes.Client = Client
+Fakes.Adapters = Adapters
 return Fakes

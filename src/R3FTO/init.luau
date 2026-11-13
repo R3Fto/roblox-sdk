@@ -59,13 +59,7 @@ local runtime = {
 		return ok and enabled == true
 	end,
 	authorization = function(secretName: string)
-		local ok, value = pcall(function()
-			return HttpService:GetSecret(secretName):AddPrefix("Bearer ")
-		end)
-		if ok then
-			return value, nil
-		end
-		return nil, "not found: add it in Creator Hub Secrets, or as a Studio Local Secret for local tests"
+		return Adapters.secretAuthorization(HttpService, secretName)
 	end,
 	poster = function(baseUrl: string, authorization: any)
 		return Adapters.httpPoster(HttpService, baseUrl, authorization, Wire)
