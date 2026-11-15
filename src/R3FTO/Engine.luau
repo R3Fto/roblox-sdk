@@ -4,10 +4,11 @@
 -- Pure Luau with no Roblox service in here. The clock, the scheduler and every channel attempt are injected, so the
 -- same code runs on a game server (task.defer / task.wait / os.clock) and in the plain-Luau tests (a virtual clock).
 --
--- One job per stable key (a PurchaseId, or a referral observation). A job has one or more channels, for a receipt the
--- DataStore copy ("storage") and the direct R3FTO delivery ("delivery"). The retry schedule:
+-- One job per stable key (a PurchaseId, or one player join that carried a creator link value). A job has one or more
+-- channels, for a receipt the DataStore copy ("storage") and the direct R3FTO delivery ("delivery"). The retry schedule:
 --   * every channel makes its first attempt immediately, and retries at 60, 180 and 300 seconds after THAT channel's
---     first attempt (offsets from the start, not delays added to each other), at most four attempts in total;
+--     first attempt (offsets from the start, not delays added to each other), at most four attempts in total. A channel
+--     may bring its own list of offsets instead (a player arrival uses a longer one, up to an hour);
 --   * a channel that succeeds stops; the other channel keeps its own remaining attempts;
 --   * a repeated submit for the same key never restarts the schedule and never starts a second, parallel sequence;
 --   * a Retry-After answer only ever SKIPS scheduled slots that come too early, so it can never add an attempt.
@@ -18,7 +19,8 @@
 local Engine = {}
 Engine.__index = Engine
 
--- The retry schedule: attempt offsets in seconds from a channel's first attempt.
+-- The retry schedule: attempt offsets in seconds from a channel's first attempt. A channel without its own `offsets`
+-- uses this one.
 Engine.OFFSETS = table.freeze({ 0, 60, 180, 300 })
 
 export type AttemptResult = {
@@ -37,6 +39,8 @@ export type AttemptResult = {
 export type ChannelSpec = {
 	name: string,
 	attempt: (record: any, attemptNumber: number) -> AttemptResult,
+	-- attempt offsets in seconds from the first attempt, starting with 0; Engine.OFFSETS when absent
+	offsets: { number }?,
 }
 
 export type Deps = {
@@ -90,6 +94,11 @@ function Engine:_log(level: string, message: string)
 	end
 end
 
+-- The attempt offsets of a channel: its own list, or the default schedule.
+local function offsetsOf(channel: Channel): { number }
+	return channel.spec.offsets or Engine.OFFSETS
+end
+
 -- Runs one scheduled attempt of a channel. Never throws: an attempt that errors is an ambiguous, retryable outcome.
 function Engine:_attempt(job: Job, channel: Channel)
 	local now = self._deps.now()
@@ -132,23 +141,24 @@ function Engine:_attempt(job: Job, channel: Channel)
 	if type(outcome.retryAfter) == "number" and outcome.retryAfter > 0 then
 		channel.notBefore = self._deps.now() + outcome.retryAfter
 	end
-	channel.state = if channel.attempts < #Engine.OFFSETS then "retry_scheduled" else "failed"
+	channel.state = if channel.attempts < #offsetsOf(channel) then "retry_scheduled" else "failed"
 end
 
 -- Runs the channel's remaining slots (all of them for a fresh channel).
 function Engine:_run(job: Job, channel: Channel)
-	for index = channel.attempts + 1, #Engine.OFFSETS do
+	local offsets = offsetsOf(channel)
+	for index = channel.attempts + 1, #offsets do
 		if TERMINAL[channel.state] then
 			return
 		end
 
 		if index > 1 then
 			local first = channel.firstAttemptAt :: number
-			local target = first + Engine.OFFSETS[index]
+			local target = first + offsets[index]
 			if channel.notBefore ~= nil and channel.notBefore > target then
 				-- Retry-After asks for a later time than this slot: skip the slot, never add one.
 				channel.skippedSlots += 1
-				if index == #Engine.OFFSETS then
+				if index == #offsets then
 					channel.state = "failed"
 				end
 				continue

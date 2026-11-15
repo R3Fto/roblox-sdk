@@ -12,6 +12,10 @@
 --   delivery.
 -- * Duplicate calls for the same PurchaseId on this server join the existing work; they never restart it.
 -- * The SDK reports evidence. It computes no creator share and no earning.
+-- * Every player join whose LaunchData carries an R3FTO creator link value is reported once, as its own job: a player
+--   who arrives with A, then B, then A again, or rejoins this server with the same value, is reported each time. The
+--   same join seen twice (PlayerAdded and the GetPlayers loop at start) is reported once. An arrival job retries on a
+--   longer schedule than a receipt (ARRIVAL_OFFSETS), so a short outage does not lose it.
 -- * The server signal tells R3FTO that this server runs the SDK: "started" once after start, "alive" every hour and
 --   "closing" once while the server shuts down, each with this server's receipt counts by durability. It runs in its own
 --   thread, never inside the receipt handler, never as an Engine job and never retried: a failed signal is followed by
@@ -28,6 +32,13 @@ Client.DEFAULT_API_BASE_URL = "https://r3f.to"
 Client.HEARTBEAT_INTERVAL = 3600
 Client.CLOSING_WAIT_LIMIT = 5
 Client.CLOSING_POLL = 0.25
+
+-- A player arrival decides the player's creator from that moment, so its delivery retries for up to an hour: attempt
+-- offsets in seconds from the first attempt (eight attempts). Receipts keep Engine.OFFSETS.
+Client.ARRIVAL_OFFSETS = table.freeze({ 0, 60, 180, 300, 600, 900, 1800, 3600 })
+
+-- Printed once per server, on the first creator link value R3FTO did not recognize. Later ones are info lines.
+Client.UNRECOGNIZED_WARNING = "a creator link value was not recognized. Test mode accepts only the Test keys TSTA, TSTB and TSTC; Production accepts real creator keys."
 
 local ENVIRONMENTS = { production = true, test = true }
 
@@ -51,8 +62,12 @@ export type Runtime = {
 	placeId: () -> number,
 	jobId: () -> string,
 	generateId: () -> string,
-	-- players: calls `callback(userId, launchData)` for every player already in the server and every new one
-	eachPlayer: (callback: (userId: number, launchData: any) -> ()) -> (),
+	-- players: calls `callback(userId, launchData, join)` for every player already in the server and every new one. `join`
+	-- is an opaque value that is the same for every observation of one join and different for every join (the Player
+	-- instance on Roblox); nil means no duplicate check.
+	eachPlayer: (callback: (userId: number, launchData: any, join: any) -> ()) -> (),
+	-- calls `callback(join)` when that join's player leaves the server (PlayerRemoving on Roblox)
+	onPlayerLeaving: ((callback: (join: any) -> ()) -> ())?,
 	onClose: (callback: () -> ()) -> (),
 }
 
@@ -83,6 +98,10 @@ function Client.new(runtime: Runtime)
 	self._signalRefusalWarned = false
 	self._signalNotConfiguredWarned = false
 	self._heartbeat = { lastKind = nil :: string?, lastSentAtUtc = nil :: string?, lastResult = nil :: string? }
+	-- the joins of players in this server that were already observed, and how many arrivals were reported
+	self._joins = {} :: { [any]: boolean }
+	self._arrivals = 0
+	self._unrecognizedWarned = false
 	return self
 end
 
@@ -156,8 +175,13 @@ function Client:start(config: any): (boolean, string?)
 		self:_submitReceipt(item.receipt, item.firstObservedAtUtc, item.simulated)
 	end
 
-	runtime.eachPlayer(function(userId: number, launchData: any)
-		self:_observePlayer(userId, launchData)
+	if runtime.onPlayerLeaving then
+		runtime.onPlayerLeaving(function(join: any)
+			self:_playerLeft(join)
+		end)
+	end
+	runtime.eachPlayer(function(userId: number, launchData: any, join: any)
+		self:_observePlayer(userId, launchData, join)
 	end)
 	runtime.onClose(function()
 		self:_onClose()
@@ -378,8 +402,16 @@ function Client:simulateTestReceipt(options: any): { [string]: any }
 	return result(false, { reason = "internal error" })
 end
 
--- A referral observation: the R3FTO creator-link reference in this player's LaunchData, with the server-seen UserId.
-function Client:_observePlayer(userId: number, launchData: any)
+-- A player arrival: the R3FTO creator link value in this join's LaunchData, with the server-seen UserId. Every join that
+-- carries a value is one job with its own key, so a later join is reported again; `join` drops a second observation of
+-- the same join. The body is built once, so every retry repeats it (R3FTO answers a retry `already_recorded`).
+function Client:_observePlayer(userId: number, launchData: any, join: any)
+	if join ~= nil then
+		if self._joins[join] then
+			return
+		end
+		self._joins[join] = true
+	end
 	local wire = self._runtime.Wire
 	local reference = wire.launchReference(launchData)
 	if reference == nil then
@@ -391,13 +423,20 @@ function Client:_observePlayer(userId: number, launchData: any)
 	end
 	local observedAt = wire.isoUtcFromMillis(self._runtime.unixMillis())
 	local body = wire.referralBody(user, reference, observedAt, self._context)
-	self._engine:submit("referral:" .. user .. ":" .. reference, body, {
+	self._arrivals += 1
+	self._engine:submit("referral:" .. self._arrivals, body, {
 		{
 			name = "delivery",
+			offsets = Client.ARRIVAL_OFFSETS,
 			attempt = function(payload: any, attempt: number)
 				local outcome = self._post(wire.REFERRALS_PATH, payload)
 				if outcome.ok then
-					self:_say("info", "creator-link reference reported (" .. tostring(outcome.facts and outcome.facts.outcome) .. ")")
+					local answer = outcome.facts and outcome.facts.outcome
+					if answer == "unrecognized_reference" then
+						self:_unrecognized()
+					else
+						self:_say("info", "creator-link reference reported (" .. tostring(answer) .. ")")
+					end
 				else
 					self:_say("warn", "creator-link reference attempt " .. attempt .. " failed (" .. tostring(outcome.kind) .. ")")
 				end
@@ -405,6 +444,23 @@ function Client:_observePlayer(userId: number, launchData: any)
 			end,
 		},
 	})
+end
+
+-- R3FTO answered that it does not know the value: one warning per server, then info lines.
+function Client:_unrecognized()
+	if not self._unrecognizedWarned then
+		self._unrecognizedWarned = true
+		self:_say("warn", Client.UNRECOGNIZED_WARNING)
+		return
+	end
+	self:_say("info", "a creator link value was not recognized")
+end
+
+-- The player of an observed join left: a later join of the same player is a new arrival.
+function Client:_playerLeft(join: any)
+	if join ~= nil then
+		self._joins[join] = nil
+	end
 end
 
 function Client:_onClose()
@@ -438,16 +494,28 @@ function Client:getReceiptStatus(purchaseId: string): { [string]: any }?
 	return snapshot
 end
 
--- R3FTO.getDiagnostics(): safe to print. No token, no PlayerId.
+-- R3FTO.getDiagnostics(): safe to print. No token, no PlayerId, no creator key.
 function Client:getDiagnostics(): { [string]: any }
 	local counts = { delivered = 0, stored_awaiting_delivery = 0, memory_only = 0, not_durable = 0 }
 	local referrals = 0
+	-- R3FTO's answers to the arrivals; `failed` counts arrivals whose delivery ended without an answer (all attempts used,
+	-- or refused). Arrivals still being sent are in none of them.
+	local outcomes = { recorded = 0, already_recorded = 0, unrecognized_reference = 0, failed = 0 }
 	for key, job in self._engine:jobs() do
 		if string.sub(key, 1, 8) == "receipt:" then
 			local durability = self._runtime.Engine.durability(job)
 			counts[durability] += 1
 		else
 			referrals += 1
+			local delivery = job.byName.delivery
+			if delivery and delivery.state == "succeeded" then
+				local answer = delivery.facts.outcome
+				if answer == "recorded" or answer == "already_recorded" or answer == "unrecognized_reference" then
+					outcomes[answer] += 1
+				end
+			elseif delivery and (delivery.state == "failed" or delivery.state == "rejected") then
+				outcomes.failed += 1
+			end
 		end
 	end
 	local problems = table.clone(self._problems)
@@ -460,6 +528,7 @@ function Client:getDiagnostics(): { [string]: any }
 		receipts = counts,
 		receiptsWaitingForStart = #self._waiting,
 		referralObservations = referrals,
+		referralOutcomes = outcomes,
 		problems = problems,
 		-- The latest server signal: its kind, when it was sent (UTC) and "sending", "recorded" or the failure kind.
 		heartbeat = {

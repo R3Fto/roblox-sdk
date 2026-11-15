@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.0 - 2026-11-15
+
+- Creator links: the SDK reads `r3f_` and a creator's R3FTO key from a player's launch data (the prefix in any letter
+  case, a key of 4 to 16 letters or digits) and sends it as `r3f_` and the key in upper case. A referral token
+  (`rt_...`) is still read as before.
+- Every join that carries a creator link value is reported, also when the same player comes back with the same value or
+  with another creator's. Before, one player and one value were reported only once per server. A join that Roblox shows
+  twice at start (`PlayerAdded` and the players already in the server) is reported once.
+- A player arrival is retried at 0, 60, 180, 300, 600, 900, 1800 and 3600 seconds (eight attempts). Receipts keep 0,
+  60, 180 and 300 seconds.
+- When R3FTO does not recognize a creator link value, one warning is printed per server (`a creator link value was not
+  recognized`, with the keys each mode accepts); later ones are info lines.
+- `R3FTO.getDiagnostics()` adds `referralOutcomes`: `recorded`, `already_recorded`, `unrecognized_reference` and
+  `failed` (no answer after every attempt, or refused). It shows no key and no UserId.
+
 ## 0.2.1 - 2026-11-13
 
 - The GitHub release carries `R3FTO.rbxm` only. The example game stays as source in

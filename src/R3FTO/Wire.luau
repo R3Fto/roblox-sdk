@@ -7,7 +7,7 @@
 --   /v1/roblox-sdk/heartbeats. Roblox ids and Robux amounts travel as decimal STRINGS so nothing can round them (Luau
 --   numbers are doubles).
 -- * Classifies an HTTP answer into the engine's attempt result.
--- * Reads the R3FTO creator-link reference from LaunchData.
+-- * Reads the R3FTO creator link value ("r3f_" and a creator key) from LaunchData.
 
 local Wire = {}
 
@@ -249,14 +249,26 @@ function Wire.heartbeatBody(kind: string, sentAtUtc: string, counts: ReceiptCoun
 	}
 end
 
--- The R3FTO creator-link reference in LaunchData: exactly an R3FTO referral token ("rt_" + 26 base32 characters).
--- Anything else (no launch data, the publisher's own launch data) is not an R3FTO reference and is ignored.
+-- The bounds of a creator key after "r3f_".
+Wire.MIN_CREATOR_KEY = 4
+Wire.MAX_CREATOR_KEY = 16
+
+-- The R3FTO creator link value in LaunchData, as it is sent to R3FTO, or nil:
+-- * "r3f_" and the creator's R3FTO key: the prefix in any letter case, a key of 4 to 16 ASCII letters or digits. It is
+--   sent as "r3f_" and the key in upper case.
+-- * an R3FTO referral token ("rt_" + 26 base32 characters), unchanged.
+-- Anything else (no launch data, the publisher's own launch data, spaces around the value) is not an R3FTO value and is
+-- ignored.
 function Wire.launchReference(launchData: any): string?
 	if type(launchData) ~= "string" then
 		return nil
 	end
 	if string.find(launchData, "^rt_[a-z2-7]+$") ~= nil and #launchData == 29 then
 		return launchData
+	end
+	local key = string.match(launchData, "^[rR]3[fF]_([A-Za-z0-9]+)$")
+	if key ~= nil and #key >= Wire.MIN_CREATOR_KEY and #key <= Wire.MAX_CREATOR_KEY then
+		return "r3f_" .. string.upper(key)
 	end
 	return nil
 end

@@ -1,4 +1,4 @@
-# R3FTO Roblox SDK (server, Luau) · 0.2.1
+# R3FTO Roblox SDK (server, Luau) · 0.3.0
 
 A server-only Luau package. It reports **developer-product receipts** and **R3FTO creator-link references** from a
 Roblox game server to R3FTO. It observes evidence. It never grants a product, never decides a purchase and never
@@ -21,7 +21,7 @@ must not reach players' devices).
 ```toml
 # wally.toml
 [server-dependencies]
-R3FTO = "mrcha0s/r3fto-roblox-sdk@0.2.1"
+R3FTO = "mrcha0s/r3fto-roblox-sdk@0.3.0"
 ```
 
 Run `wally install`, map `ServerPackages` into ServerScriptService in your Rojo project, then use this line in place of
@@ -35,7 +35,7 @@ local R3FTO = require(game:GetService("ServerScriptService").ServerPackages.R3FT
 
 ```bash
 git submodule add https://github.com/R3Fto/roblox-sdk.git vendor/r3fto-roblox-sdk
-git -C vendor/r3fto-roblox-sdk checkout v0.2.1
+git -C vendor/r3fto-roblox-sdk checkout v0.3.0
 ```
 
 ```json
@@ -80,7 +80,7 @@ pcall(R3FTO.observeReceipt, receiptInfo)
 
 R3FTO.simulateTestReceipt({ userId = 1, productId = 2, currencySpent = 25, simulationId = "demo-1" })  -- Test only
 R3FTO.getReceiptStatus(purchaseId)               -- this server's view of one receipt
-R3FTO.getDiagnostics()                           -- safe to print: no token, no PlayerId
+R3FTO.getDiagnostics()                           -- safe to print: no token, no PlayerId, no creator key
 ```
 
 `start` options:
@@ -114,7 +114,8 @@ changes that decision.
 4. **Retries.** Each channel makes its first attempt immediately. Retries follow at 60, 180 and 300 seconds after
    that channel's first attempt, four attempts at most per channel. A channel that succeeds stops. A request R3FTO
    rejects (4xx other than 408/425/429) is not retried. `Retry-After` can only skip a scheduled attempt, never add one.
-   A repeated callback on the same server joins the running work and never restarts the schedule.
+   A repeated callback on the same server joins the running work and never restarts the schedule. A player arrival
+   (see Creator links) retries longer: at 60, 180, 300, 600, 900, 1800 and 3600 seconds, eight attempts at most.
 
 Durability (`getReceiptStatus(...).durability`):
 
@@ -129,6 +130,25 @@ Per channel: `state` is `pending`, `in_progress`, `retry_scheduled`, `succeeded`
 `rejected`. `lastError` is `storage_failed`, `transport_failed`, `ambiguous` (a timeout: R3FTO may or may not have it;
 the same PurchaseId is retried), `throttled`, `rejected` or `not_configured` (the SDK token secret is not available on
 this server, so nothing was sent).
+
+## Creator links
+
+A creator link brings a player into your experience with `r3f_` and the creator's R3FTO key in its launch data (for
+example `r3f_KAEL`). You never create these links and need no code for them: after `start`, the SDK reads the launch
+data of every player who joins.
+
+- **Every join counts.** Each join that carries a creator link value is reported once with the server-seen UserId, also
+  when the player comes back with the same value or with another creator's. The same join is never reported twice.
+- **What.** `POST {apiBaseUrl}/v1/roblox-sdk/referral-observations` with the same token: the value (prefix in lower case,
+  key in upper case), the UserId and the join time. Any other launch data is yours and is ignored.
+- **Retries.** At 0, 60, 180, 300, 600, 900, 1800 and 3600 seconds after the first attempt, so a short outage does not
+  lose an arrival. Every retry sends the same report, and R3FTO counts it once.
+- **Test and Production.** A Test token accepts only the Test keys `TSTA`, `TSTB` and `TSTC`; a Production token accepts
+  real creator keys. When R3FTO does not recognize a value, one warning is printed per server
+  (`a creator link value was not recognized`); later ones are info lines.
+- **Diagnostics.** `getDiagnostics().referralObservations` counts this server's arrivals, and
+  `getDiagnostics().referralOutcomes` counts R3FTO's answers (`recorded`, `already_recorded`, `unrecognized_reference`)
+  and `failed` (no answer after every attempt, or refused). No key and no UserId is printed or kept in diagnostics.
 
 ## Server signal
 
@@ -169,7 +189,7 @@ Roblox ids and Robux amounts are decimal strings. Times are ISO 8601 UTC with mi
 
 ```json
 POST /v1/roblox-sdk/receipts
-{ "environment": "test", "universe_id": "123", "place_id": "456", "server_job_id": "…", "sdk_version": "0.2.1",
+{ "environment": "test", "universe_id": "123", "place_id": "456", "server_job_id": "…", "sdk_version": "0.3.0",
   "simulated": false,
   "receipt": { "purchase_id": "…", "player_id": "1", "product_id": "2", "currency_spent": "200",
                "currency_type": "Robux", "place_id_where_purchased": "456", "purchase_channel": null },
@@ -179,7 +199,7 @@ POST /v1/roblox-sdk/receipts
 
 POST /v1/roblox-sdk/referral-observations
 { "environment", "universe_id", "place_id", "server_job_id", "sdk_version",
-  "roblox_user_id": "1", "launch_reference": "rt_…", "observed_at": "…Z" }
+  "roblox_user_id": "1", "launch_reference": "r3f_KAEL", "observed_at": "…Z" }
 → 200 { "outcome": "recorded" | "already_recorded" | "unrecognized_reference" }
 
 POST /v1/roblox-sdk/heartbeats
@@ -208,7 +228,8 @@ DataStore value (schema 1):
   - retry offsets, a channel stopping after it succeeds, Retry-After and rejection;
   - duplicate callbacks, the immutable and adopted first observation time;
   - independent DataStore and transport failures, the no-I/O handler call;
-  - the pre-start queue, environment scopes, simulation marking, the LaunchData reference and log hygiene;
+  - the pre-start queue, environment scopes, simulation marking and log hygiene;
+  - creator link values: the accepted format, one report per join, the arrival retry schedule and the warning;
   - the server signal: its hourly schedule, no retry, the counts, the closing wait limit and the Studio id.
 - CI runs these tests on every push, builds `R3FTO.rbxm` with Rojo and checks that the example place builds.
 - To check your own integration end to end, use your R3FTO Test token in a published Test experience, then look at

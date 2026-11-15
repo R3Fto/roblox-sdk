@@ -12,7 +12,8 @@ local Fakes = {}
 Fakes.BASE_MILLIS = 1762857045123 -- 2025-11-11T10:30:45.123Z at virtual time 0
 
 -- run() without a limit stops this many virtual seconds after the current time: the hourly server signal never stops on
--- its own, and every receipt schedule settles well within it (its last retry is 300 seconds after the first attempt).
+-- its own, and every receipt schedule settles well within it (its last retry is 300 seconds after the first attempt). A
+-- player arrival retries for up to 3600 seconds, so its tests pass an explicit limit.
 Fakes.SETTLE = 3000
 
 -- Virtual time. spawn() queues a coroutine at the current time; sleep() (only inside a queued coroutine) parks it.
@@ -195,6 +196,7 @@ function Fakes.runtime(options)
 	end
 	local logs = {}
 	local players = {}
+	local leavers = {}
 	local closers = {}
 	local ids = 0
 	local runtime = {
@@ -244,6 +246,9 @@ function Fakes.runtime(options)
 		eachPlayer = function(callback)
 			table.insert(players, callback)
 		end,
+		onPlayerLeaving = function(callback)
+			table.insert(leavers, callback)
+		end,
 		onClose = function(callback)
 			table.insert(closers, callback)
 		end,
@@ -256,9 +261,19 @@ function Fakes.runtime(options)
 		dataStores = dataStores,
 		http = http,
 		logs = logs,
-		join = function(userId, launchData)
+		-- One player join (a new join value, like a new Player instance on Roblox), or, with `join`, another observation of
+		-- that same join (the PlayerAdded and GetPlayers overlap). Answers the join value.
+		join = function(userId, launchData, join)
+			local handle = join or {}
 			for _, callback in players do
-				callback(userId, launchData)
+				callback(userId, launchData, handle)
+			end
+			return handle
+		end,
+		-- The player of a join leaves the server (PlayerRemoving on Roblox).
+		leave = function(join)
+			for _, callback in leavers do
+				callback(join)
 			end
 		end,
 		-- Roblox runs each BindToClose callback in its own thread and shuts down after 30 seconds at most. Runs the

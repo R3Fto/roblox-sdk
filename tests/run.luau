@@ -64,7 +64,7 @@ test("readReceipt accepts the Roblox receipt table and refuses anything else", f
 	eq(assert(Wire.readReceipt(Fakes.receipt({ CurrencySpent = 0 }))).currencySpent, "0", "free purchase kept")
 end)
 
-test("LaunchData carries an R3FTO reference only when it is exactly a referral token", function()
+test("LaunchData carries an R3FTO referral token only when it is exactly one", function()
 	local token = "rt_abcdefghijklmnopqrstuvwxyz"
 	eq(#token, 29)
 	eq(Wire.launchReference(token), token)
@@ -74,6 +74,29 @@ test("LaunchData carries an R3FTO reference only when it is exactly a referral t
 	eq(Wire.launchReference("rt_abcdefghijklmnopqrstuvwxy1"), nil, "1 is not base32")
 	eq(Wire.launchReference('{"level":3}'), nil, "publisher launch data")
 	eq(Wire.launchReference(token .. "x"), nil, "too long")
+end)
+
+test("a creator link value is r3f_ and a key of 4 to 16 letters or digits, sent in upper case", function()
+	eq(Wire.launchReference("r3f_kael"), "r3f_KAEL", "lower case key")
+	eq(Wire.launchReference("R3F_Kael"), "r3f_KAEL", "upper case prefix, mixed case key")
+	eq(Wire.launchReference("r3f_B4CD5FGH"), "r3f_B4CD5FGH", "a generated key with digits")
+	eq(Wire.launchReference("r3f_TSTA"), "r3f_TSTA", "a Test key")
+	eq(Wire.launchReference("r3f_" .. string.rep("K", 16)), "r3f_" .. string.rep("K", 16), "16 characters")
+	eq(Wire.launchReference("r3f_ab"), nil, "too short")
+	eq(Wire.launchReference("r3f_ABC"), nil, "3 characters")
+	eq(Wire.launchReference("r3f_" .. string.rep("K", 17)), nil, "17 characters")
+	eq(Wire.launchReference("r3f_KA-EL"), nil, "a hyphen")
+	eq(Wire.launchReference("r3f_KA_EL"), nil, "an underscore")
+	eq(Wire.launchReference("r3f_KAEL "), nil, "a trailing space")
+	eq(Wire.launchReference(" r3f_KAEL"), nil, "a leading space")
+	eq(Wire.launchReference("r3f_KAEL\n"), nil, "a new line")
+	eq(Wire.launchReference("xr3f_KAEL"), nil, "anything before the prefix")
+	eq(Wire.launchReference("r3f_"), nil, "no key")
+	eq(Wire.launchReference("r3fKAEL"), nil, "no underscore")
+	eq(Wire.launchReference("r3f_KÄEL"), nil, "a non-ASCII letter")
+	eq(Wire.launchReference(5), nil, "not a string")
+	eq(Wire.launchReference({ r3f = "KAEL" }), nil, "a table")
+	eq(Wire.launchReference('{"r3f":"KAEL"}'), nil, "JSON")
 end)
 
 test("HTTP classification", function()
@@ -391,21 +414,25 @@ test("start refuses a bad configuration and reports setup problems without faili
 	eq(#h.client:getDiagnostics().problems, 3)
 end)
 
-test("a creator-link reference is reported once per player with the server-seen UserId", function()
+test("a referral token is reported once per join with the server-seen UserId", function()
 	local f = Fakes.runtime()
 	assert(f.client:start({ environment = "production" }))
 	local token = "rt_abcdefghijklmnopqrstuvwxyz"
-	f.join(1234567, token)
-	f.join(1234567, token) -- same player, same reference (another join on this server)
+	local first = f.join(1234567, token)
+	f.leave(first)
+	f.scheduler.run(10)
+	f.join(1234567, token) -- same player, same value, another join on this server: reported again
 	f.join(7654321, nil) -- no launch data
 	f.join(5555555, '{"publisher":"data"}') -- the publisher's own launch data
 	f.scheduler.run()
 	local sent = Fakes.requestsTo(f.http, Wire.REFERRALS_PATH)
-	eq(#sent, 1)
+	eq(#sent, 2)
 	eq(sent[1].body.roblox_user_id, "1234567")
 	eq(sent[1].body.launch_reference, token)
 	eq(sent[1].body.environment, "production")
 	eq(sent[1].headers.Authorization, "Bearer <secret>")
+	eq(sent[2].body.launch_reference, token)
+	assert(sent[2].body.observed_at ~= sent[1].body.observed_at, "each join has its own observation time")
 end)
 
 test("diagnostics never contain a PlayerId or the token", function()
@@ -762,6 +789,205 @@ test("the secret's value never reaches the logs, the problems or the diagnostics
 		end
 		for _, text in strings(f.client:getReceiptStatus(answer.purchaseId)) do
 			assert(not string.find(text, sentinel, 1, true), "the secret in the receipt status")
+		end
+	end
+end)
+
+-- Player arrivals (creator link values) ----------------------------------------------------------------------------
+
+local KAEL = "r3f_KAEL"
+local NOVA = "r3f_NOVA"
+
+-- An R3FTO that answers every arrival with `answer(launch_reference)` ({ status, body }) and every other request with
+-- `recorded`.
+local function arrivalServer(answer)
+	return function(url, body)
+		if string.sub(url, -#Wire.REFERRALS_PATH) == Wire.REFERRALS_PATH then
+			return answer(body.launch_reference)
+		end
+		return { status = 200, body = { outcome = "recorded", receipt_id = "r-1", matches_first_record = true } }
+	end
+end
+
+local function launchReferences(requests)
+	local list = {}
+	for _, request in requests do
+		table.insert(list, request.body.launch_reference)
+	end
+	return table.concat(list, ",")
+end
+
+test("arrivals A, then B, then A again on one server are three reports", function()
+	local f = Fakes.runtime()
+	assert(f.client:start({ environment = "production" }))
+	local first = f.join(1234567, "r3f_kael") -- sent in upper case
+	f.scheduler.run(10)
+	f.leave(first)
+	local second = f.join(1234567, NOVA)
+	f.scheduler.run(20)
+	f.leave(second)
+	f.join(1234567, KAEL)
+	f.scheduler.run(30)
+	local sent = Fakes.requestsTo(f.http, Wire.REFERRALS_PATH)
+	eq(launchReferences(sent), "r3f_KAEL,r3f_NOVA,r3f_KAEL", "one report per join, in order")
+	eq(times(sent), "0,10,20")
+	eq(sent[1].body.observed_at, Wire.isoUtcFromMillis(Fakes.BASE_MILLIS), "the join time")
+	eq(sent[3].body.observed_at, Wire.isoUtcFromMillis(Fakes.BASE_MILLIS + 20 * 1000))
+	eq(f.client:getDiagnostics().referralObservations, 3)
+end)
+
+test("a rejoin with the same value is a new report", function()
+	local f = Fakes.runtime()
+	assert(f.client:start({ environment = "test" }))
+	local first = f.join(1234567, "r3f_TSTA")
+	f.scheduler.run(5)
+	f.leave(first)
+	f.scheduler.run(65)
+	f.join(1234567, "r3f_TSTA")
+	f.scheduler.run(70)
+	local sent = Fakes.requestsTo(f.http, Wire.REFERRALS_PATH)
+	eq(#sent, 2, "the rejoin is reported")
+	eq(sent[2].body.launch_reference, "r3f_TSTA")
+	eq(sent[2].body.environment, "test")
+	eq(times(sent), "0,65")
+end)
+
+test("one join seen by PlayerAdded and by the GetPlayers loop is one report", function()
+	local f = Fakes.runtime()
+	assert(f.client:start({ environment = "production" }))
+	local join = f.join(1234567, KAEL)
+	f.join(1234567, KAEL, join) -- the same join observed again (the overlap at start)
+	f.scheduler.run(10)
+	f.join(1234567, KAEL, join) -- and again later, while the player is still in the server
+	f.scheduler.run(20)
+	eq(#Fakes.requestsTo(f.http, Wire.REFERRALS_PATH), 1)
+	eq(f.client:getDiagnostics().referralObservations, 1)
+	-- After the player leaves, the next join of the same player is a new report.
+	f.leave(join)
+	f.join(1234567, KAEL)
+	f.scheduler.run(30)
+	eq(#Fakes.requestsTo(f.http, Wire.REFERRALS_PATH), 2)
+end)
+
+test("an arrival is retried at 0, 60, 180, 300, 600, 900, 1800 and 3600 seconds; a receipt keeps four attempts", function()
+	local f = Fakes.runtime({ server = failing(503) })
+	assert(f.client:start({ environment = "production" }))
+	f.join(1234567, KAEL)
+	f.client:observeReceipt(Fakes.receipt())
+	f.scheduler.run(HOUR + 600)
+	local arrivals = Fakes.requestsTo(f.http, Wire.REFERRALS_PATH)
+	eq(times(arrivals), "0,60,180,300,600,900,1800,3600", "eight attempts within an hour")
+	eq(times(Fakes.requestsTo(f.http, Wire.RECEIPTS_PATH)), "0,60,180,300", "receipts keep their schedule")
+	for _, request in arrivals do
+		eq(request.body.observed_at, arrivals[1].body.observed_at, "every attempt repeats the same body")
+		eq(request.body.launch_reference, KAEL)
+	end
+	local job = assert(f.client._engine:get("referral:1"))
+	eq(job.byName.delivery.state, "failed")
+	eq(job.byName.delivery.attempts, 8)
+	eq(f.client:getDiagnostics().referralOutcomes.failed, 1)
+end)
+
+test("Retry-After skips slots in the arrival schedule and never adds one", function()
+	local f = Fakes.runtime({ server = arrivalServer(function()
+		return { status = 429, headers = { ["Retry-After"] = "700" }, body = { error = { code = "X", message = "x" } } }
+	end) })
+	assert(f.client:start({ environment = "production" }))
+	f.join(1234567, KAEL)
+	f.scheduler.run(HOUR + 600)
+	eq(times(Fakes.requestsTo(f.http, Wire.REFERRALS_PATH)), "0,900,1800,3600", "the 60, 180, 300 and 600 s slots are skipped")
+	local delivery = assert(f.client._engine:get("referral:1")).byName.delivery
+	eq(delivery.skippedSlots, 4)
+	eq(delivery.attempts, 4)
+	eq(delivery.state, "failed")
+	eq(delivery.lastError, "throttled")
+end)
+
+test("an arrival that R3FTO answers stops; a refused one is not retried", function()
+	local calls = 0
+	local f = Fakes.runtime({ server = arrivalServer(function(reference)
+		if reference == NOVA then
+			return { status = 400, body = { error = { code = "VALIDATION_ERROR", message = "x" } } }
+		end
+		calls += 1
+		if calls < 3 then
+			return { status = 500 }
+		end
+		return { status = 200, body = { outcome = "recorded" } }
+	end) })
+	assert(f.client:start({ environment = "production" }))
+	f.join(1234567, KAEL)
+	f.join(7654321, NOVA)
+	f.scheduler.run(HOUR + 600)
+	local sent = Fakes.requestsTo(f.http, Wire.REFERRALS_PATH)
+	local kael, nova = {}, {}
+	for _, request in sent do
+		table.insert(if request.body.launch_reference == KAEL then kael else nova, request)
+	end
+	eq(times(kael), "0,60,180", "stopped after the answer")
+	eq(times(nova), "0", "a refused report is not retried")
+	local outcomes = f.client:getDiagnostics().referralOutcomes
+	eq(outcomes.recorded, 1)
+	eq(outcomes.failed, 1, "rejected counts as failed")
+end)
+
+test("an unrecognized value warns once per server, then logs info lines", function()
+	local f = Fakes.runtime({ server = arrivalServer(function()
+		return { status = 200, body = { outcome = "unrecognized_reference" } }
+	end) })
+	assert(f.client:start({ environment = "test" }))
+	f.join(1234567, KAEL)
+	f.join(7654321, NOVA)
+	f.join(5555555, "r3f_TSTB")
+	f.scheduler.run(10)
+	eq(count(f.logs, "warn", "[R3FTO] " .. Client.UNRECOGNIZED_WARNING), 1, "one warning")
+	eq(
+		Client.UNRECOGNIZED_WARNING,
+		"a creator link value was not recognized. Test mode accepts only the Test keys TSTA, TSTB and TSTC; Production accepts real creator keys."
+	)
+	eq(count(f.logs, "info", "a creator link value was not recognized"), 2, "later ones are info lines")
+	eq(#Fakes.requestsTo(f.http, Wire.REFERRALS_PATH), 3, "an answer is not retried")
+	eq(f.client:getDiagnostics().referralOutcomes.unrecognized_reference, 3)
+end)
+
+test("diagnostics count arrival outcomes and contain no key and no UserId", function()
+	local f = Fakes.runtime({ server = arrivalServer(function(reference)
+		if reference == "r3f_KAEL" then
+			return { status = 200, body = { outcome = "recorded" } }
+		elseif reference == "r3f_NOVA" then
+			return { status = 200, body = { outcome = "already_recorded" } }
+		elseif reference == "r3f_GONE" then
+			return { status = 200, body = { outcome = "unrecognized_reference" } }
+		elseif reference == "r3f_DOWN" then
+			return { status = 503 }
+		end
+		return { status = 403, body = { error = { code = "ENVIRONMENT_MISMATCH", message = "x" } } }
+	end) })
+	assert(f.client:start({ environment = "production" }))
+	f.join(1111111, "r3f_KAEL")
+	f.join(2222222, "r3f_NOVA")
+	f.join(3333333, "r3f_GONE")
+	f.join(4444444, "r3f_DOWN")
+	f.join(5555555, "r3f_SHUT")
+	f.join(6666666, nil) -- no value: not an arrival
+	f.scheduler.run(100)
+	local early = f.client:getDiagnostics()
+	eq(early.referralOutcomes.failed, 1, "the refused one; the one still retrying is in none")
+	f.scheduler.run(HOUR + 600)
+	local diagnostics = f.client:getDiagnostics()
+	eq(diagnostics.referralObservations, 5)
+	eq(diagnostics.referralOutcomes.recorded, 1)
+	eq(diagnostics.referralOutcomes.already_recorded, 1)
+	eq(diagnostics.referralOutcomes.unrecognized_reference, 1)
+	eq(diagnostics.referralOutcomes.failed, 2)
+	for _, text in strings(diagnostics) do
+		for _, secret in { "KAEL", "NOVA", "GONE", "DOWN", "SHUT", "1111111", "2222222", "3333333", "4444444", "5555555" } do
+			assert(not string.find(text, secret, 1, true), "a key or a UserId in the diagnostics")
+		end
+	end
+	for _, line in f.logs do
+		for _, secret in { "KAEL", "NOVA", "GONE", "DOWN", "SHUT", "1111111", "5555555" } do
+			assert(not string.find(line.message, secret, 1, true), "a key or a UserId in a log line")
 		end
 	end
 end)

@@ -10,6 +10,9 @@
 --   R3FTO.getDiagnostics() -> table (no token, no PlayerId)
 --   R3FTO.VERSION
 --
+-- After start the SDK also reports every player join whose launch data carries an R3FTO creator link value ("r3f_" and
+-- the creator's key), once per join, with the server-seen UserId.
+--
 -- After start the SDK also sends a server signal: "started" once, "alive" every hour and "closing" when the server shuts
 -- down, each with this server's receipt counts. It never affects a purchase.
 --
@@ -79,17 +82,27 @@ local runtime = {
 	generateId = function()
 		return HttpService:GenerateGUID(false)
 	end,
-	eachPlayer = function(callback: (number, any) -> ())
+	-- Each join is passed with its Player instance: a player who joins between the PlayerAdded connection and the
+	-- GetPlayers loop is observed twice with the same instance, and the client reports that join once. A player who left
+	-- before the deferred observation ran is no longer in Players and is skipped.
+	eachPlayer = function(callback: (number, any, any) -> ())
 		local function observe(player: Player)
+			if player.Parent ~= Players then
+				return
+			end
 			local ok, joinData = pcall(function()
 				return player:GetJoinData()
 			end)
-			callback(player.UserId, if ok and type(joinData) == "table" then joinData.LaunchData else nil)
+			callback(player.UserId, if ok and type(joinData) == "table" then joinData.LaunchData else nil, player)
 		end
 		Players.PlayerAdded:Connect(observe)
 		for _, player in Players:GetPlayers() do
 			task.defer(observe, player)
 		end
+	end,
+	-- A player who leaves frees that join, so a later join of the same player (a new Player instance) is a new arrival.
+	onPlayerLeaving = function(callback: (any) -> ())
+		Players.PlayerRemoving:Connect(callback)
 	end,
 	-- The close callback warns about receipts without a durable copy and sends the "closing" signal, waiting for it at
 	-- most a few seconds of Roblox's 30-second shutdown limit.
