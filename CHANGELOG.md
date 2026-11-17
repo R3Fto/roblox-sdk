@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.0 - 2026-11-17
+
+- `R3FTO.openKeyPanel(player)` opens the optional R3FTO Key panel for one player. The player types a creator's R3FTO
+  Key. Only the panel's own part (`KeyPanelGui`) is copied to that player's device, and only when you call it.
+- `getDiagnostics()` adds `keyPanelOutcomes`.
+- Nothing changes for games that do not call it.
+
 ## 0.3.0 - 2026-11-15
 
 - Creator links: the SDK reads `r3f_` and a creator's R3FTO key from a player's launch data (the prefix in any letter

@@ -20,6 +20,10 @@
 --   "closing" once while the server shuts down, each with this server's receipt counts by durability. It runs in its own
 --   thread, never inside the receipt handler, never as an Engine job and never retried: a failed signal is followed by
 --   the next one on schedule. It never affects a purchase.
+-- * The optional key panel opens only when the game calls openKeyPanel(player). The game passes no key: the player types
+--   it. Each panel request is one attempt, never an Engine job and never retried; one request runs at a time per player
+--   and at most KEY_PANEL_PER_MINUTE a minute on this server, so receipts keep their share of the server's HTTP
+--   requests. The panel shows only its own fixed words for each answer.
 
 local Client = {}
 Client.__index = Client
@@ -39,6 +43,23 @@ Client.ARRIVAL_OFFSETS = table.freeze({ 0, 60, 180, 300, 600, 900, 1800, 3600 })
 
 -- Printed once per server, on the first creator link value R3FTO did not recognize. Later ones are info lines.
 Client.UNRECOGNIZED_WARNING = "a creator link value was not recognized. Test mode accepts only the Test keys TSTA, TSTB and TSTC; Production accepts real creator keys."
+
+-- The key panel: why openKeyPanel refused, the per-server request limit and its window in seconds.
+Client.KEY_PANEL_NOT_STARTED = "R3FTO.start has not run"
+Client.KEY_PANEL_NOT_A_PLAYER = "not a player in this server"
+Client.KEY_PANEL_FOLDER_MISSING = "the KeyPanelGui folder is missing"
+Client.KEY_PANEL_PER_MINUTE = 60
+Client.KEY_PANEL_WINDOW = 60
+
+-- One Output line (info) per key panel answer that came after a request was sent to R3FTO, by answer token. An answer
+-- given on this server without a request (busy, throttled, a wrong sender, a closing SDK) prints nothing. No key, no
+-- UserId, no player name.
+local KEY_PANEL_LINES = {
+	accepted = "key panel: accepted",
+	unknown_key = "key panel: unknown key",
+	unavailable = "key panel: not available",
+	failed = "key panel: try again later",
+}
 
 local ENVIRONMENTS = { production = true, test = true }
 
@@ -69,6 +90,11 @@ export type Runtime = {
 	-- calls `callback(join)` when that join's player leaves the server (PlayerRemoving on Roblox)
 	onPlayerLeaving: ((callback: (join: any) -> ()) -> ())?,
 	onClose: (callback: () -> ()) -> (),
+	-- true when `player` is a player in this server now
+	isPlayerInServer: ((player: any) -> boolean)?,
+	-- the key panel opener over the KeyPanelGui folder, looked up on every call, or nil when the folder is missing.
+	-- `open(player)` answers true, or false and "player" or "folder" (see RobloxAdapters.keyPanelOpener).
+	keyPanelOpener: ((onRequest: (any, any, any, any) -> string) -> ((player: any) -> (boolean, string?))?)?,
 }
 
 local function result(accepted: boolean, fields: { [string]: any }): { [string]: any }
@@ -102,6 +128,13 @@ function Client.new(runtime: Runtime)
 	self._joins = {} :: { [any]: boolean }
 	self._arrivals = 0
 	self._unrecognizedWarned = false
+	-- the key panel: the players (by server-seen UserId) whose request is running, the start times of this server's
+	-- requests in the last KEY_PANEL_WINDOW seconds, the answers given and the two once-per-server warnings
+	self._panelBusy = {} :: { [string]: boolean }
+	self._panelTimes = {} :: { number }
+	self._panelOutcomes = { accepted = 0, unknown_key = 0, unavailable = 0, busy = 0, throttled = 0, failed = 0 }
+	self._panelRefusalWarned = false
+	self._panelNotConfiguredWarned = false
 	return self
 end
 
@@ -477,6 +510,139 @@ function Client:_onClose()
 	self:_closingSignal()
 end
 
+-- R3FTO.openKeyPanel(player): opens the optional key panel for one player in this server; a second call for the same
+-- player replaces that player's panel. Answers true, or false and the reason (also printed as a warning). Never throws.
+-- The KeyPanelGui folder is looked up here, not when the SDK is required, so an install without it still loads and its
+-- receipts run.
+function Client:openKeyPanel(player: any): (boolean, string?)
+	local called, opened, reason = pcall(self._openKeyPanel, self, player)
+	if not called then
+		-- An unexpected Roblox error while building the panel, most likely because the player left meanwhile.
+		opened, reason = false, Client.KEY_PANEL_NOT_A_PLAYER
+	end
+	if opened then
+		return true, nil
+	end
+	self:_say("warn", "openKeyPanel: " .. tostring(reason))
+	return false, reason
+end
+
+function Client:_openKeyPanel(player: any): (boolean, string?)
+	local runtime = self._runtime
+	if not self._started then
+		return false, Client.KEY_PANEL_NOT_STARTED
+	end
+	if runtime.isPlayerInServer == nil or not runtime.isPlayerInServer(player) then
+		return false, Client.KEY_PANEL_NOT_A_PLAYER
+	end
+	local open = if runtime.keyPanelOpener
+		then runtime.keyPanelOpener(function(owner: any, invoker: any, action: any, key: any): string
+			return self:_keyPanelRequest(owner, invoker, action, key)
+		end)
+		else nil
+	if open == nil then
+		return false, Client.KEY_PANEL_FOLDER_MISSING
+	end
+	local opened, why = open(player)
+	if opened then
+		return true, nil
+	end
+	if why == "folder" then
+		return false, Client.KEY_PANEL_FOLDER_MISSING
+	end
+	return false, Client.KEY_PANEL_NOT_A_PLAYER
+end
+
+-- Counts one key panel answer and returns the token the panel receives. `sent` is true when the answer came after a
+-- request was sent to R3FTO; only those answers print their info line.
+function Client:_panelAnswer(answer: string, sent: boolean?): string
+	self._panelOutcomes[answer] += 1
+	if sent and KEY_PANEL_LINES[answer] ~= nil then
+		self:_say("info", KEY_PANEL_LINES[answer])
+	end
+	return answer
+end
+
+-- True when this server may send one more key panel request now: fewer than KEY_PANEL_PER_MINUTE started in the last
+-- KEY_PANEL_WINDOW seconds. A request that is let through is counted at once.
+function Client:_panelTake(): boolean
+	local now = self._runtime.now()
+	local times = self._panelTimes
+	while #times > 0 and now - times[1] >= Client.KEY_PANEL_WINDOW do
+		table.remove(times, 1)
+	end
+	if #times >= Client.KEY_PANEL_PER_MINUTE then
+		return false
+	end
+	table.insert(times, now)
+	return true
+end
+
+-- One request from a player's key panel (the panel's remote). `owner` is the player the panel was opened for, `invoker`
+-- the player Roblox says sent it. Returns one answer token and never throws:
+--   accepted, unknown_key, unavailable   R3FTO's answer
+--   busy                                 this player's previous request has not returned yet (nothing sent)
+--   throttled                            this server reached its key panel limit for the minute (nothing sent)
+--   failed                               anything else: a refusal, no answer, a wrong sender, the SDK closing
+-- The UserId is the server-seen one; nothing the device sends but the action and the key is used.
+function Client:_keyPanelRequest(owner: any, invoker: any, action: any, key: any): string
+	local runtime = self._runtime
+	local wire = runtime.Wire
+	if invoker ~= owner or not self._started or self._closed or runtime.isPlayerInServer == nil or not runtime.isPlayerInServer(owner) then
+		return self:_panelAnswer("failed")
+	end
+	if action ~= "use" then
+		return self:_panelAnswer("failed")
+	end
+	local panelKey = wire.panelKey(key)
+	if panelKey == nil then
+		-- The panel itself sends only 4 to 16 letters, so only a changed device gets here.
+		return self:_panelAnswer("unknown_key")
+	end
+	local user = wire.digits(owner.UserId)
+	if user == nil or user == "0" then
+		return self:_panelAnswer("failed")
+	end
+	-- One request at a time per player, by UserId, so it also holds across a reopened panel and a rejoin on this server.
+	-- It is released only when the request returns, never on a timer.
+	if self._panelBusy[user] then
+		return self:_panelAnswer("busy")
+	end
+	if not self:_panelTake() then
+		return self:_panelAnswer("throttled")
+	end
+	self._panelBusy[user] = true
+	local body = wire.selectionBody(user, panelKey, self._context)
+	local called, outcome = pcall(self._post, wire.SELECTIONS_PATH, body, wire.SELECTION_OUTCOMES)
+	self._panelBusy[user] = nil
+	if not called or type(outcome) ~= "table" then
+		return self:_panelAnswer("failed", true)
+	end
+	if outcome.ok then
+		local answer = outcome.facts and outcome.facts.outcome
+		if type(answer) == "string" and wire.SELECTION_OUTCOMES[answer] then
+			return self:_panelAnswer(answer, true)
+		end
+		return self:_panelAnswer("failed", true)
+	end
+	if outcome.kind == "rejected" and not self._panelRefusalWarned then
+		-- A refusal (the token, the environment or the universe) repeats on every request: say it once.
+		self._panelRefusalWarned = true
+		self._panelOutcomes.failed += 1
+		self:_say("warn", "R3FTO refused a key panel request (" .. tostring(outcome.detail) .. "); check the SDK token and the environment")
+		return "failed"
+	end
+	if outcome.kind == "not_configured" and not self._panelNotConfiguredWarned then
+		-- The secret is missing on this server, so no request ever leaves it: say it once (the start warning names the fix).
+		self._panelNotConfiguredWarned = true
+		self._panelOutcomes.failed += 1
+		self:_say("warn", "key panel requests are not sent: the SDK token secret is not available (see the warning at start)")
+		return "failed"
+	end
+	-- Without the secret no request left this server: no info line.
+	return self:_panelAnswer("failed", outcome.kind ~= "not_configured")
+end
+
 -- R3FTO.getReceiptStatus(purchaseId): this server's view of one receipt, or nil.
 function Client:getReceiptStatus(purchaseId: string): { [string]: any }?
 	local job = self._engine:get("receipt:" .. tostring(purchaseId))
@@ -494,7 +660,8 @@ function Client:getReceiptStatus(purchaseId: string): { [string]: any }?
 	return snapshot
 end
 
--- R3FTO.getDiagnostics(): safe to print. No token, no PlayerId, no creator key.
+-- R3FTO.getDiagnostics(): safe to print. No token, no PlayerId, no creator key. `keyPanelOutcomes` counts the answers
+-- the key panel received (no key, no UserId).
 function Client:getDiagnostics(): { [string]: any }
 	local counts = { delivered = 0, stored_awaiting_delivery = 0, memory_only = 0, not_durable = 0 }
 	local referrals = 0
@@ -529,6 +696,7 @@ function Client:getDiagnostics(): { [string]: any }
 		receiptsWaitingForStart = #self._waiting,
 		referralObservations = referrals,
 		referralOutcomes = outcomes,
+		keyPanelOutcomes = table.clone(self._panelOutcomes),
 		problems = problems,
 		-- The latest server signal: its kind, when it was sent (UTC) and "sending", "recorded" or the failure kind.
 		heartbeat = {

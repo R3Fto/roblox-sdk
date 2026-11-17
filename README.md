@@ -1,15 +1,17 @@
-# R3FTO Roblox SDK (server, Luau) · 0.3.0
+# R3FTO Roblox SDK (server, Luau) · 0.4.0
 
-A server-only Luau package. It reports **developer-product receipts** and **R3FTO creator-link references** from a
-Roblox game server to R3FTO. It observes evidence. It never grants a product, never decides a purchase and never
-computes a creator share or an earning.
+A server-only Luau package. Only its optional key panel reaches a player's device, and only when your server opens it
+for that player. It reports **developer-product receipts** and **R3FTO creator-link references** from a Roblox game
+server to R3FTO. It observes evidence. It never grants a product, never decides a purchase and never computes a creator
+share or an earning.
 
 Full guide: <https://r3f.to/docs/roblox>. License: MIT (see `LICENSE`).
 
 ## Install
 
 Pick one. Each gives you the same `R3FTO` ModuleScript in **ServerScriptService** (never in ReplicatedStorage: the SDK
-must not reach players' devices).
+must not reach players' devices). Only the optional key panel's own part (`KeyPanelGui`) is copied to a player's device,
+and only when your server calls `R3FTO.openKeyPanel` for that player.
 
 ### A. Roblox Studio: drag and drop
 
@@ -21,7 +23,7 @@ must not reach players' devices).
 ```toml
 # wally.toml
 [server-dependencies]
-R3FTO = "mrcha0s/r3fto-roblox-sdk@0.3.0"
+R3FTO = "mrcha0s/r3fto-roblox-sdk@0.4.0"
 ```
 
 Run `wally install`, map `ServerPackages` into ServerScriptService in your Rojo project, then use this line in place of
@@ -35,7 +37,7 @@ local R3FTO = require(game:GetService("ServerScriptService").ServerPackages.R3FT
 
 ```bash
 git submodule add https://github.com/R3Fto/roblox-sdk.git vendor/r3fto-roblox-sdk
-git -C vendor/r3fto-roblox-sdk checkout v0.3.0
+git -C vendor/r3fto-roblox-sdk checkout v0.4.0
 ```
 
 ```json
@@ -56,7 +58,10 @@ ServerScriptService
     ├── Engine         ModuleScript  ← src/R3FTO/Engine.luau
     ├── RobloxAdapters ModuleScript  ← src/R3FTO/RobloxAdapters.luau
     ├── Version        ModuleScript  ← src/R3FTO/Version.luau
-    └── Wire           ModuleScript  ← src/R3FTO/Wire.luau
+    ├── Wire           ModuleScript  ← src/R3FTO/Wire.luau
+    └── KeyPanelGui    Folder
+        ├── Look       ModuleScript  ← src/R3FTO/KeyPanelGui/Look.luau
+        └── Panel      LocalScript   ← src/R3FTO/KeyPanelGui/Panel.client.luau
 ```
 
 ### Then, for every install
@@ -81,6 +86,7 @@ pcall(R3FTO.observeReceipt, receiptInfo)
 R3FTO.simulateTestReceipt({ userId = 1, productId = 2, currencySpent = 25, simulationId = "demo-1" })  -- Test only
 R3FTO.getReceiptStatus(purchaseId)               -- this server's view of one receipt
 R3FTO.getDiagnostics()                           -- safe to print: no token, no PlayerId, no creator key
+R3FTO.openKeyPanel(player)                       -- optional: the R3FTO Key panel for one player
 ```
 
 `start` options:
@@ -150,6 +156,22 @@ data of every player who joins.
   `getDiagnostics().referralOutcomes` counts R3FTO's answers (`recorded`, `already_recorded`, `unrecognized_reference`)
   and `failed` (no answer after every attempt, or refused). No key and no UserId is printed or kept in diagnostics.
 
+## The R3FTO Key panel (optional)
+
+Players can also type a creator's R3FTO Key in your game. Call `R3FTO.openKeyPanel(player)` from server code, for
+example when the player presses your own button. The panel's words and layout are fixed, and no function sets a key for
+a player.
+
+- **What a key does.** A key the player types counts for that creator from the moment R3FTO records it, and comes before
+  any creator link. Between creator links, the last link still wins.
+- **What is sent.** `POST {apiBaseUrl}/v1/roblox-sdk/creator-selections` with your SDK token: the server-seen UserId and
+  the key. The panel shows only fixed words for each answer.
+- **Limits.** One request at a time per player and at most 60 a minute per server, so receipts keep their share of your
+  server's HTTP requests. R3FTO also limits requests per game. A request is never retried on its own.
+- **Test and Production.** Use the Test token in Studio. A Test token accepts only the Test keys `TSTA`, `TSTB` and
+  `TSTC`. A Production token in Studio records real keys that count in public numbers.
+- **Diagnostics.** `getDiagnostics().keyPanelOutcomes` counts the answers. No key and no UserId is printed or kept.
+
 ## Server signal
 
 After `start`, each game server tells R3FTO that it runs the SDK, so your Roblox page can show your servers and any
@@ -189,7 +211,7 @@ Roblox ids and Robux amounts are decimal strings. Times are ISO 8601 UTC with mi
 
 ```json
 POST /v1/roblox-sdk/receipts
-{ "environment": "test", "universe_id": "123", "place_id": "456", "server_job_id": "…", "sdk_version": "0.3.0",
+{ "environment": "test", "universe_id": "123", "place_id": "456", "server_job_id": "…", "sdk_version": "0.4.0",
   "simulated": false,
   "receipt": { "purchase_id": "…", "player_id": "1", "product_id": "2", "currency_spent": "200",
                "currency_type": "Robux", "place_id_where_purchased": "456", "purchase_channel": null },
@@ -207,6 +229,11 @@ POST /v1/roblox-sdk/heartbeats
   "kind": "started" | "alive" | "closing", "sent_at": "…Z",
   "receipts": { "memory_only": 0, "stored_awaiting_delivery": 0, "not_durable": 0 } }
 → 200 { "outcome": "recorded" }
+
+POST /v1/roblox-sdk/creator-selections
+{ "environment", "universe_id", "place_id", "server_job_id", "sdk_version",
+  "roblox_user_id": "1", "action": "set", "creator_key": "KAEL" }
+→ 200 { "outcome": "accepted" | "unknown_key" | "unavailable" }
 ```
 
 Errors use the standard R3FTO error body. Codes:
@@ -215,6 +242,7 @@ Errors use the standard R3FTO error body. Codes:
 - `401 AUTHENTICATION_REQUIRED` and `401 CREDENTIAL_REVOKED`.
 - `403 ENVIRONMENT_MISMATCH`, `403 UNIVERSE_MISMATCH` and `403 SIMULATION_NOT_ALLOWED`.
 - `413`, `415` and `503 SERVICE_UNAVAILABLE`.
+- `429 RATE_LIMITED`.
 
 DataStore value (schema 1):
 

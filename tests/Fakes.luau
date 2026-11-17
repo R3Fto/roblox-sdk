@@ -6,6 +6,7 @@ local Engine = require("../src/R3FTO/Engine")
 local Wire = require("../src/R3FTO/Wire")
 local Client = require("../src/R3FTO/Client")
 local Adapters = require("../src/R3FTO/RobloxAdapters")
+local Look = require("../src/R3FTO/KeyPanelGui/Look")
 
 local Fakes = {}
 
@@ -171,9 +172,12 @@ function Fakes.httpService(scheduler, server)
 	return service
 end
 
--- A server that answers every request with `recorded`.
+-- A server that answers every request with `recorded` (a key panel request with `accepted`).
 function Fakes.okServer()
 	return function(url)
+		if string.find(url, "creator-selections", 1, true) then
+			return { status = 200, body = { outcome = "accepted" } }
+		end
 		if string.find(url, "referral", 1, true) then
 			return { status = 200, body = { outcome = "recorded" } }
 		end
@@ -181,8 +185,12 @@ function Fakes.okServer()
 	end
 end
 
+-- The Players service of the fakes: a fake player is in the server while its Parent is this value.
+Fakes.PLAYERS = table.freeze({ name = "Players" })
+
 -- A full runtime over the fakes. options: server, universeId, placeId, jobId ("" is Studio), httpEnabled, secretMissing
--- (the token secret does not exist), secretError (the error GetSecret raises then), secretValue (its content).
+-- (the token secret does not exist), secretError (the error GetSecret raises then), secretValue (its content),
+-- keyPanelFolder (false: the install has no KeyPanelGui folder), keyPanelParts (false: the folder lacks Look or Panel).
 function Fakes.runtime(options)
 	options = options or {}
 	local scheduler = Fakes.scheduler()
@@ -198,6 +206,8 @@ function Fakes.runtime(options)
 	local players = {}
 	local leavers = {}
 	local closers = {}
+	local panels = {}
+	local panelOpens = 0
 	local ids = 0
 	local runtime = {
 		Engine = Engine,
@@ -252,6 +262,33 @@ function Fakes.runtime(options)
 		onClose = function(callback)
 			table.insert(closers, callback)
 		end,
+		isPlayerInServer = function(player)
+			return type(player) == "table" and player.Parent == Fakes.PLAYERS
+		end,
+		-- Like RobloxAdapters.keyPanelOpener without Roblox instances: the remote's handler of each opened panel is kept in
+		-- `panels`, by player, so a test can send what the player's device would send.
+		keyPanelOpener = function(onRequest)
+			if options.keyPanelFolder == false then
+				return nil
+			end
+			return function(player)
+				if type(player) ~= "table" or player.Parent ~= Fakes.PLAYERS then
+					return false, "player"
+				end
+				if options.keyPanelParts == false then
+					return false, "folder"
+				end
+				panelOpens += 1
+				panels[player] = function(invoker, action, key)
+					local ok, answer = pcall(onRequest, player, invoker, action, key)
+					if ok and type(answer) == "string" then
+						return answer
+					end
+					return "failed"
+				end
+				return true, nil
+			end
+		end,
 	}
 	local client = Client.new(runtime)
 	return {
@@ -275,6 +312,21 @@ function Fakes.runtime(options)
 			for _, callback in leavers do
 				callback(join)
 			end
+		end,
+		-- A player in this server (a new Player instance on Roblox). Setting its Parent to nil makes it leave.
+		player = function(userId)
+			return { UserId = userId, Parent = Fakes.PLAYERS }
+		end,
+		-- What the device of `invoker` (by default the panel's own player) sends through the key panel opened for
+		-- `player`. Answers the token the device receives. Errors when no panel was opened for that player.
+		panelRequest = function(player, action, key, invoker)
+			local handler = panels[player]
+			assert(handler, "no key panel was opened for this player")
+			return handler(if invoker ~= nil then invoker else player, action, key)
+		end,
+		-- How many key panels were opened.
+		panelOpens = function()
+			return panelOpens
 		end,
 		-- Roblox runs each BindToClose callback in its own thread and shuts down after 30 seconds at most. Runs the
 		-- scheduler until every callback has returned (or 30 virtual seconds passed) and answers the seconds it took.
@@ -324,4 +376,5 @@ Fakes.Engine = Engine
 Fakes.Wire = Wire
 Fakes.Client = Client
 Fakes.Adapters = Adapters
+Fakes.Look = Look
 return Fakes

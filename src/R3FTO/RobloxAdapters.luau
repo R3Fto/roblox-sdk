@@ -96,8 +96,9 @@ end
 -- A POST to R3FTO with the bearer token. `authorization` is a Roblox Secret (HttpService:GetSecret(...):AddPrefix(
 -- "Bearer ")): the plaintext is never readable by any script, and Roblox only lets it travel in a header or the URL.
 -- Without it nothing is sent: the request never leaves the server, so the answer is "not_configured", not a refusal.
+-- `outcomes` is the set of answers this one request knows (Wire.classifyHttp); without it, the shared default set.
 function Adapters.httpPoster(httpService: any, baseUrl: string, authorization: any, Wire: any)
-	return function(path: string, body: any): AttemptResult
+	return function(path: string, body: any, outcomes: { [string]: boolean }?): AttemptResult
 		if authorization == nil then
 			return { ok = false, kind = "not_configured", retryable = false, detail = "the SDK token secret is not available" }
 		end
@@ -134,7 +135,68 @@ function Adapters.httpPoster(httpService: any, baseUrl: string, authorization: a
 				decoded = value
 			end
 		end
-		return Wire.classifyHttp(response.StatusCode, response.Headers, decoded)
+		return Wire.classifyHttp(response.StatusCode, response.Headers, decoded, outcomes)
+	end
+end
+
+-- The name of the key panel's ScreenGui in a player's PlayerGui, and of its remote.
+Adapters.KEY_PANEL_NAME = "R3FTOKeyPanel"
+Adapters.KEY_PANEL_REQUEST = "Request"
+
+-- The optional key panel, opened for one player at a time. `template` is the KeyPanelGui folder (the Look ModuleScript
+-- and the Panel LocalScript); under ServerScriptService neither ever runs or reaches a device. `open(player)`:
+-- * refuses unless the player is in this server and has a PlayerGui: (false, "player");
+-- * refuses when the folder lacks Look or Panel: (false, "folder");
+-- * destroys that player's open panel, so a second call replaces it;
+-- * builds a new ScreenGui for that player alone (Roblox automatic translation off, so the fixed English words show
+--   exactly) with a RemoteFunction "Request" whose server handler calls `onRequest(player, invoker, action, key)` inside
+--   pcall and returns only an answer token, never text;
+-- * clones Look and Panel into it and parents it to the player's PlayerGui last. Only then does Roblox copy it to that
+--   player's device, where Panel draws the panel.
+-- The server never calls the player's device (no InvokeClient): only the device asks, and the server answers.
+function Adapters.keyPanelOpener(players: any, template: any, onRequest: (any, any, any, any) -> string)
+	return function(player: any): (boolean, string?)
+		if player == nil or player.Parent ~= players then
+			return false, "player"
+		end
+		local playerGui = player:FindFirstChildOfClass("PlayerGui")
+		if playerGui == nil then
+			return false, "player"
+		end
+		local look = template:FindFirstChild("Look")
+		local panel = template:FindFirstChild("Panel")
+		if look == nil or panel == nil then
+			return false, "folder"
+		end
+
+		local open = playerGui:FindFirstChild(Adapters.KEY_PANEL_NAME)
+		while open ~= nil do
+			open:Destroy()
+			open = playerGui:FindFirstChild(Adapters.KEY_PANEL_NAME)
+		end
+
+		local gui = Instance.new("ScreenGui")
+		gui.Name = Adapters.KEY_PANEL_NAME
+		gui.ResetOnSpawn = false
+		gui.DisplayOrder = 1000
+		gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+		gui.AutoLocalize = false
+
+		local request = Instance.new("RemoteFunction")
+		request.Name = Adapters.KEY_PANEL_REQUEST
+		request.OnServerInvoke = function(invoker: any, action: any, key: any): string
+			local ok, answer = pcall(onRequest, player, invoker, action, key)
+			if ok and type(answer) == "string" then
+				return answer
+			end
+			return "failed"
+		end
+		request.Parent = gui
+
+		look:Clone().Parent = gui
+		panel:Clone().Parent = gui
+		gui.Parent = playerGui
+		return true, nil
 	end
 end
 

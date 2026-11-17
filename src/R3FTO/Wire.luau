@@ -3,11 +3,12 @@
 --
 -- * Validates the receiptInfo table Roblox passes to the publisher's own receipt handler.
 -- * Builds the DataStore record (DataStore "R3FTO_Receipts_v1", scope = environment, key = PurchaseId, schema 1).
--- * Builds the JSON bodies of POST /v1/roblox-sdk/receipts, /v1/roblox-sdk/referral-observations and
---   /v1/roblox-sdk/heartbeats. Roblox ids and Robux amounts travel as decimal STRINGS so nothing can round them (Luau
---   numbers are doubles).
+-- * Builds the JSON bodies of POST /v1/roblox-sdk/receipts, /v1/roblox-sdk/referral-observations,
+--   /v1/roblox-sdk/heartbeats and /v1/roblox-sdk/creator-selections. Roblox ids and Robux amounts travel as decimal
+--   STRINGS so nothing can round them (Luau numbers are doubles).
 -- * Classifies an HTTP answer into the engine's attempt result.
 -- * Reads the R3FTO creator link value ("r3f_" and a creator key) from LaunchData.
+-- * Checks the key a player typed in the optional key panel.
 
 local Wire = {}
 
@@ -18,6 +19,7 @@ Wire.MAX_PURCHASE_ID = 100 -- R3FTO: purchase_id is at most 100 characters
 Wire.RECEIPTS_PATH = "/v1/roblox-sdk/receipts"
 Wire.REFERRALS_PATH = "/v1/roblox-sdk/referral-observations"
 Wire.HEARTBEATS_PATH = "/v1/roblox-sdk/heartbeats"
+Wire.SELECTIONS_PATH = "/v1/roblox-sdk/creator-selections"
 Wire.SIMULATED_PREFIX = "r3fto-sim-"
 
 local MAX_SAFE_INTEGER = 9007199254740991 -- 2^53 - 1: above it a Luau number is no longer an exact integer
@@ -273,7 +275,45 @@ function Wire.launchReference(launchData: any): string?
 	return nil
 end
 
-local OUTCOMES = { recorded = true, already_recorded = true, unrecognized_reference = true }
+-- The longest text the key panel's remote reads as a key; anything longer is never looked at.
+Wire.MAX_PANEL_KEY_BYTES = 64
+
+-- The key a player typed in the key panel, as it is sent to R3FTO, or nil: after trimming spaces and upper-casing, 4 to
+-- 16 ASCII letters A-Z. Anything else (a digit, any other character, a non-string, more than MAX_PANEL_KEY_BYTES bytes)
+-- is never sent.
+function Wire.panelKey(text: any): string?
+	if type(text) ~= "string" or #text > Wire.MAX_PANEL_KEY_BYTES then
+		return nil
+	end
+	local trimmed = string.match(text, "^%s*(.-)%s*$") or ""
+	local key = string.upper(trimmed)
+	if string.find(key, "^[A-Z]+$") == nil or #key < Wire.MIN_CREATOR_KEY or #key > Wire.MAX_CREATOR_KEY then
+		return nil
+	end
+	return key
+end
+
+-- POST /v1/roblox-sdk/creator-selections body: the server-seen UserId and the typed key. There is no time field: the
+-- record time is R3FTO's own. The action is always "set": a typed key is replaced by typing another one.
+function Wire.selectionBody(userId: string, key: string, context: Context)
+	return {
+		environment = context.environment,
+		universe_id = context.universeId,
+		place_id = context.placeId,
+		server_job_id = context.serverJobId,
+		sdk_version = context.sdkVersion,
+		roblox_user_id = userId,
+		action = "set",
+		creator_key = key,
+	}
+end
+
+-- The answers of receipts, arrivals and server signals: the default set of classifyHttp.
+local OUTCOMES: { [string]: boolean } = { recorded = true, already_recorded = true, unrecognized_reference = true }
+
+-- The key panel's answers. Only the key panel request passes this set, so for a receipt, an arrival or a server signal
+-- these answers stay unknown (ambiguous).
+Wire.SELECTION_OUTCOMES = table.freeze({ accepted = true, unknown_key = true, unavailable = true })
 
 local function header(headers: any, name: string): string?
 	if type(headers) ~= "table" then
@@ -288,14 +328,16 @@ local function header(headers: any, name: string): string?
 	return nil
 end
 
--- Classifies an HTTP answer. `body` is the decoded JSON body or nil.
+-- Classifies an HTTP answer. `body` is the decoded JSON body or nil. `outcomes` is the set of answers this request
+-- knows; without it, the receipt, arrival and signal answers.
 --   2xx with a known outcome           ok (R3FTO committed it to PostgreSQL before answering)
 --   2xx without one                    ambiguous, retried with the same identity
 --   408, 425, 429, 5xx                 retryable; Retry-After (seconds) is honoured when present
 --   any other 4xx                      rejected: retrying the same request cannot succeed
-function Wire.classifyHttp(statusCode: number, headers: any, body: any): { [string]: any }
+function Wire.classifyHttp(statusCode: number, headers: any, body: any, outcomes: { [string]: boolean }?): { [string]: any }
+	local known: { [string]: boolean } = outcomes or OUTCOMES
 	if statusCode >= 200 and statusCode < 300 then
-		if type(body) == "table" and OUTCOMES[body.outcome] then
+		if type(body) == "table" and type(body.outcome) == "string" and known[body.outcome] then
 			local facts: { [string]: any } = { outcome = body.outcome }
 			if type(body.receipt_id) == "string" then
 				facts.receiptId = body.receipt_id

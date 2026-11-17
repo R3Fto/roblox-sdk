@@ -1,6 +1,8 @@
 --!nonstrict
 -- R3FTO Roblox SDK (server only). This file is the "R3FTO" ModuleScript; Engine, Wire, Client, RobloxAdapters and
--- Version are its child ModuleScripts. See sdk/roblox/README.md for the Studio layout.
+-- Version are its child ModuleScripts. The optional KeyPanelGui folder holds the key panel's own part (the Look
+-- ModuleScript and the Panel LocalScript); it is copied to a player's device only when the server opens the panel for
+-- that player. See sdk/roblox/README.md for the Studio layout.
 --
 -- Public API:
 --   R3FTO.start(config) -> (ok, reason?)
@@ -8,6 +10,7 @@
 --   R3FTO.simulateTestReceipt({ userId, productId, currencySpent }) -> same shape (R3FTO Test environment only)
 --   R3FTO.getReceiptStatus(purchaseId) -> snapshot | nil
 --   R3FTO.getDiagnostics() -> table (no token, no PlayerId)
+--   R3FTO.openKeyPanel(player) -> (ok, reason?) (optional: the R3FTO Key panel for one player; no function sets a key)
 --   R3FTO.VERSION
 --
 -- After start the SDK also reports every player join whose launch data carries an R3FTO creator link value ("r3f_" and
@@ -109,6 +112,17 @@ local runtime = {
 	onClose = function(callback: () -> ())
 		game:BindToClose(callback)
 	end,
+	isPlayerInServer = function(player: any): boolean
+		return typeof(player) == "Instance" and player:IsA("Player") and player.Parent == Players
+	end,
+	-- The KeyPanelGui folder is looked up only when a panel opens, so an install without it still loads.
+	keyPanelOpener = function(onRequest: (any, any, any, any) -> string)
+		local template = script:FindFirstChild("KeyPanelGui")
+		if template == nil then
+			return nil
+		end
+		return Adapters.keyPanelOpener(Players, template, onRequest)
+	end,
 }
 
 local client = Client.new(runtime :: any)
@@ -135,6 +149,10 @@ end
 
 function R3FTO.getDiagnostics(): { [string]: any }
 	return client:getDiagnostics()
+end
+
+function R3FTO.openKeyPanel(player: Player): (boolean, string?)
+	return client:openKeyPanel(player)
 end
 
 return table.freeze(R3FTO)

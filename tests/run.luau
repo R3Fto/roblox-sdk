@@ -992,6 +992,415 @@ test("diagnostics count arrival outcomes and contain no key and no UserId", func
 	end
 end)
 
+-- Key panel -------------------------------------------------------------------------------------------------------------
+
+local Look = Fakes.Look
+
+local function selections(f)
+	return Fakes.requestsTo(f.http, Wire.SELECTIONS_PATH)
+end
+
+-- An R3FTO that answers every key panel request with `answer(creator_key)` ({ status, headers?, body? }) and every other
+-- request like Fakes.okServer.
+local function selectionServer(answer)
+	local others = Fakes.okServer()
+	return function(url, body, headers, time)
+		if string.sub(url, -#Wire.SELECTIONS_PATH) == Wire.SELECTIONS_PATH then
+			return answer(body.creator_key)
+		end
+		return others(url, body, headers, time)
+	end
+end
+
+-- A started SDK over the fakes.
+local function started(options)
+	local f = Fakes.runtime(options)
+	assert(f.client:start({ environment = "production" }))
+	return f
+end
+
+-- A player in the server with the key panel open.
+local function panelFor(f, userId)
+	local player = f.player(userId)
+	local ok, reason = f.client:openKeyPanel(player)
+	assert(ok, reason)
+	return player
+end
+
+local function warnings(logs)
+	local found = 0
+	for _, line in logs do
+		if line.level == "warn" then
+			found += 1
+		end
+	end
+	return found
+end
+
+test("a panel key is 4 to 16 letters A-Z after trimming and upper-casing; anything else never reaches R3FTO", function()
+	eq(Wire.panelKey("kael"), "KAEL", "lower case")
+	eq(Wire.panelKey("  Kael "), "KAEL", "spaces around it")
+	eq(Wire.panelKey(string.rep("K", 16)), string.rep("K", 16), "16 letters")
+	eq(Wire.panelKey("KAE"), nil, "3 letters")
+	eq(Wire.panelKey(string.rep("K", 17)), nil, "17 letters")
+	eq(Wire.panelKey("KA3L"), nil, "a digit")
+	eq(Wire.panelKey("KA EL"), nil, "a space inside")
+	eq(Wire.panelKey("KA-EL"), nil, "a hyphen")
+	eq(Wire.panelKey("KÄEL"), nil, "a non-ASCII letter")
+	eq(Wire.panelKey(string.rep(" ", 61) .. "KAEL"), nil, "more than 64 bytes")
+	eq(Wire.panelKey(1234), nil, "a number")
+	eq(Wire.panelKey(nil), nil, "nothing")
+
+	local f = started()
+	local player = panelFor(f, 1234567)
+	for _, key in { "KAE", "KA3L", string.rep("K", 17), "", 42, { "KAEL" }, string.rep("A", 65), false } do
+		eq(f.panelRequest(player, "use", key), "unknown_key", "a key the panel itself never sends")
+	end
+	eq(f.panelRequest(player, "use"), "unknown_key", "no key")
+	eq(#selections(f), 0, "nothing reached R3FTO")
+	eq(f.panelRequest(player, "use", " kael "), "accepted")
+	eq(selections(f)[1].body.creator_key, "KAEL", "sent in upper case")
+end)
+
+test("a key panel request carries the server-seen UserId and the key, the action set and no time", function()
+	local f = started()
+	local player = panelFor(f, 1234567)
+	eq(f.panelRequest(player, "use", "KAEL"), "accepted")
+	local sent = selections(f)
+	eq(#sent, 1)
+	local body = sent[1].body
+	local names = {}
+	for name in body do
+		table.insert(names, name)
+	end
+	table.sort(names)
+	eq(table.concat(names, ","), "action,creator_key,environment,place_id,roblox_user_id,sdk_version,server_job_id,universe_id")
+	eq(body.action, "set")
+	eq(body.roblox_user_id, "1234567", "the UserId the server sees")
+	eq(body.creator_key, "KAEL")
+	eq(body.environment, "production")
+	eq(body.universe_id, "111")
+	eq(body.place_id, "222")
+	eq(body.server_job_id, "job-1")
+	eq(body.sdk_version, "0.1.0-test")
+	eq(sent[1].headers.Authorization, "Bearer <secret>", "the same token as every route")
+end)
+
+test("an action other than use, another player's device or a player who left sends nothing", function()
+	local f = started()
+	local player = panelFor(f, 1234567)
+	for _, action in { "clear", "remove", "set", "USE", 5, false, {} } do
+		eq(f.panelRequest(player, action, "KAEL"), "failed", "action " .. tostring(action))
+	end
+	eq(f.panelRequest(player, nil, "KAEL"), "failed", "no action")
+	local other = f.player(7654321)
+	eq(f.panelRequest(player, "use", "KAEL", other), "failed", "another player's device")
+	player.Parent = nil
+	eq(f.panelRequest(player, "use", "KAEL"), "failed", "the player left")
+	eq(#selections(f), 0, "nothing reached R3FTO")
+end)
+
+test("a key panel request is one attempt, never an Engine job, never a receipt or an arrival", function()
+	local f = started({ server = selectionServer(function()
+		return { status = 503 }
+	end) })
+	local player = panelFor(f, 1234567)
+	eq(f.panelRequest(player, "use", "KAEL"), "failed")
+	f.scheduler.run(2 * HOUR)
+	eq(#selections(f), 1, "never retried")
+	eq(next(f.client._engine:jobs()), nil, "no Engine job")
+	local diagnostics = f.client:getDiagnostics()
+	eq(diagnostics.referralObservations, 0)
+	eq(diagnostics.receipts.delivered + diagnostics.receipts.memory_only + diagnostics.receipts.not_durable + diagnostics.receipts.stored_awaiting_delivery, 0)
+end)
+
+test("one key panel request at a time per player, released only when the call returns", function()
+	local f = started()
+	f.http.latency = 20
+	local answers = {}
+	local first = panelFor(f, 1234567)
+	f.scheduler.spawn(function()
+		answers.first = f.panelRequest(first, "use", "KAEL")
+	end)
+	f.scheduler.run(1)
+	eq(#selections(f), 1, "the first request is in flight")
+	eq(answers.first, nil)
+
+	eq(f.panelRequest(first, "use", "NOVA"), "busy", "a second press")
+	assert(f.client:openKeyPanel(first))
+	eq(f.panelRequest(first, "use", "NOVA"), "busy", "a reopened panel")
+	local rejoined = panelFor(f, 1234567)
+	eq(f.panelRequest(rejoined, "use", "NOVA"), "busy", "the same player rejoined this server")
+	eq(#selections(f), 1, "busy sends nothing")
+
+	local other = panelFor(f, 7654321)
+	f.scheduler.spawn(function()
+		answers.other = f.panelRequest(other, "use", "NOVA")
+	end)
+	f.scheduler.run(2)
+	eq(#selections(f), 2, "another player is not held up")
+
+	f.scheduler.run(19)
+	eq(f.panelRequest(first, "use", "NOVA"), "busy", "no timer releases it")
+	f.scheduler.run(21)
+	eq(answers.first, "accepted")
+	eq(answers.other, "accepted")
+	f.scheduler.spawn(function()
+		answers.again = f.panelRequest(first, "use", "NOVA")
+	end)
+	f.scheduler.run(45)
+	eq(answers.again, "accepted", "released when the call returned")
+	eq(#selections(f), 3)
+	eq(f.client:getDiagnostics().keyPanelOutcomes.busy, 4)
+	eq(count(f.logs, "info", "key panel: accepted"), 3, "one line per answer from R3FTO")
+	eq(count(f.logs, "info", "key panel: try again later"), 0, "busy prints nothing")
+end)
+
+test("at most 60 key panel requests a minute per server; beyond it throttled, and receipts still go out", function()
+	local f = started()
+	local answers = {}
+	for i = 1, Client.KEY_PANEL_PER_MINUTE + 1 do
+		table.insert(answers, f.panelRequest(panelFor(f, 1000000 + i), "use", "KAEL"))
+	end
+	eq(Client.KEY_PANEL_PER_MINUTE, 60)
+	eq(answers[60], "accepted")
+	eq(answers[61], "throttled")
+	eq(#selections(f), 60, "the 61st was not sent")
+	f.client:observeReceipt(Fakes.receipt())
+	f.scheduler.run(1)
+	eq(#Fakes.requestsTo(f.http, Wire.RECEIPTS_PATH), 1, "the receipt still went out")
+	f.scheduler.run(59)
+	eq(f.panelRequest(panelFor(f, 2000001), "use", "KAEL"), "throttled", "still the same minute")
+	f.scheduler.run(60)
+	eq(f.panelRequest(panelFor(f, 2000002), "use", "KAEL"), "accepted", "a minute later")
+	eq(#selections(f), 61)
+	eq(f.client:getDiagnostics().keyPanelOutcomes.throttled, 2)
+end)
+
+test("a 200 accepted is ok for the key panel while a receipt still classifies it ambiguous", function()
+	eq(Wire.classifyHttp(200, {}, { outcome = "accepted" }).kind, "ambiguous", "the default answers")
+	eq(Wire.classifyHttp(200, {}, { outcome = "unknown_key" }).kind, "ambiguous")
+	eq(Wire.classifyHttp(200, {}, { outcome = "unavailable" }).kind, "ambiguous")
+	local panel = Wire.classifyHttp(200, {}, { outcome = "accepted" }, Wire.SELECTION_OUTCOMES)
+	eq(panel.ok, true)
+	eq(panel.facts.outcome, "accepted")
+	eq(Wire.classifyHttp(200, {}, { outcome = "unknown_key" }, Wire.SELECTION_OUTCOMES).ok, true)
+	eq(Wire.classifyHttp(200, {}, { outcome = "unavailable" }, Wire.SELECTION_OUTCOMES).ok, true)
+	eq(Wire.classifyHttp(200, {}, { outcome = "recorded" }, Wire.SELECTION_OUTCOMES).kind, "ambiguous", "a receipt answer")
+	eq(Wire.classifyHttp(200, {}, { outcome = "cleared" }, Wire.SELECTION_OUTCOMES).kind, "ambiguous", "no removal answer")
+	eq(Wire.classifyHttp(200, {}, { outcome = "recorded" }).ok, true, "the default answers are unchanged")
+
+	local f = started({ server = function()
+		return { status = 200, body = { outcome = "accepted" } }
+	end })
+	local player = panelFor(f, 1234567)
+	eq(f.panelRequest(player, "use", "KAEL"), "accepted")
+	local answer = f.client:observeReceipt(Fakes.receipt())
+	f.scheduler.run()
+	local status = assert(f.client:getReceiptStatus(answer.purchaseId))
+	eq(status.channels.delivery.lastError, "ambiguous", "the receipt was not taken as delivered")
+	eq(#Fakes.requestsTo(f.http, Wire.RECEIPTS_PATH), 4, "and kept its retries")
+end)
+
+test("the key panel answers: R3FTO's three answers as they are, everything else failed", function()
+	local cases = {
+		{ { status = 200, body = { outcome = "accepted" } }, "accepted" },
+		{ { status = 200, body = { outcome = "unknown_key" } }, "unknown_key" },
+		{ { status = 200, body = { outcome = "unavailable" } }, "unavailable" },
+		{ { status = 200, body = { outcome = "recorded" } }, "failed" },
+		{ { status = 200, body = { outcome = "cleared" } }, "failed" },
+		{ { status = 200 }, "failed" },
+		{ { status = 400, body = { error = { code = "VALIDATION_ERROR", message = "x" } } }, "failed" },
+		{ { status = 401, body = { error = { code = "AUTHENTICATION_REQUIRED", message = "x" } } }, "failed" },
+		{ { status = 403, body = { error = { code = "ENVIRONMENT_MISMATCH", message = "x" } } }, "failed" },
+		{ { status = 429, headers = { ["Retry-After"] = "30" }, body = { error = { code = "RATE_LIMITED", message = "x" } } }, "failed" },
+		{ { status = 503, body = { error = { code = "SERVICE_UNAVAILABLE", message = "x" } } }, "failed" },
+	}
+	for index, case in cases do
+		local f = started({ server = selectionServer(function()
+			return case[1]
+		end) })
+		eq(f.panelRequest(panelFor(f, 1234567), "use", "KAEL"), case[2], "case " .. index)
+		eq(#selections(f), 1, "one attempt, case " .. index)
+	end
+
+	local silent = started({ server = selectionServer(function()
+		error("request timed out")
+	end) })
+	eq(silent.panelRequest(panelFor(silent, 1234567), "use", "KAEL"), "failed", "no answer")
+	eq(#selections(silent), 1, "not retried")
+
+	local unconfigured = Fakes.runtime({ secretMissing = true })
+	assert(unconfigured.client:start({ environment = "production" }))
+	eq(unconfigured.panelRequest(panelFor(unconfigured, 1234567), "use", "KAEL"), "failed", "no token secret")
+	eq(#selections(unconfigured), 0, "nothing sent without the secret")
+end)
+
+test("openKeyPanel refusals; without the KeyPanelGui folder the SDK still runs its receipts", function()
+	local f = Fakes.runtime()
+	local player = f.player(1234567)
+	local ok, reason = f.client:openKeyPanel(player)
+	eq(ok, false)
+	eq(reason, Client.KEY_PANEL_NOT_STARTED, "before start")
+	assert(f.client:start({ environment = "production" }))
+	for _, value in { 1234567, "player", { UserId = 1 }, false } do
+		local opened, why = f.client:openKeyPanel(value)
+		eq(opened, false)
+		eq(why, Client.KEY_PANEL_NOT_A_PLAYER, "not a player: " .. tostring(value))
+	end
+	eq(select(2, f.client:openKeyPanel(nil)), Client.KEY_PANEL_NOT_A_PLAYER, "nil")
+	local left = f.player(7654321)
+	left.Parent = nil
+	eq(select(2, f.client:openKeyPanel(left)), Client.KEY_PANEL_NOT_A_PLAYER, "a player who left")
+	eq(f.panelOpens(), 0, "nothing opened")
+	eq(f.client:openKeyPanel(player), true)
+	eq(f.client:openKeyPanel(player), true, "a second call replaces the panel")
+	eq(f.panelOpens(), 2)
+
+	local bare = Fakes.runtime({ keyPanelFolder = false })
+	assert(bare.client:start({ environment = "production" }))
+	local opened, why = bare.client:openKeyPanel(bare.player(1234567))
+	eq(opened, false)
+	eq(why, Client.KEY_PANEL_FOLDER_MISSING)
+	local answer = bare.client:observeReceipt(Fakes.receipt())
+	bare.scheduler.run()
+	eq(assert(bare.client:getReceiptStatus(answer.purchaseId)).durability, "delivered", "receipts run without the folder")
+
+	local partial = Fakes.runtime({ keyPanelParts = false })
+	assert(partial.client:start({ environment = "production" }))
+	eq(select(2, partial.client:openKeyPanel(partial.player(1234567))), Client.KEY_PANEL_FOLDER_MISSING, "a folder without Look or Panel")
+
+	local older = Fakes.runtime()
+	older.runtime.keyPanelOpener = nil
+	assert(older.client:start({ environment = "production" }))
+	eq(select(2, older.client:openKeyPanel(older.player(1234567))), Client.KEY_PANEL_FOLDER_MISSING, "no opener at all")
+end)
+
+test("a refused key panel request and a missing secret each warn once per server", function()
+	local f = started({ server = selectionServer(function()
+		return { status = 403, body = { error = { code = "ENVIRONMENT_MISMATCH", message = "x" } } }
+	end) })
+	f.scheduler.run(1)
+	local player = panelFor(f, 1234567)
+	local before = warnings(f.logs)
+	for _ = 1, 3 do
+		eq(f.panelRequest(player, "use", "KAEL"), "failed")
+	end
+	eq(warnings(f.logs) - before, 1, "one warning for three refusals")
+	eq(f.client:getDiagnostics().keyPanelOutcomes.failed, 3)
+
+	local g = Fakes.runtime({ secretMissing = true })
+	assert(g.client:start({ environment = "production" }))
+	g.scheduler.run(1)
+	local other = panelFor(g, 1234567)
+	local start = warnings(g.logs)
+	for _ = 1, 3 do
+		eq(g.panelRequest(other, "use", "KAEL"), "failed")
+	end
+	eq(warnings(g.logs) - start, 1, "one warning without the secret")
+	eq(#selections(g), 0)
+end)
+
+test("key panel diagnostics count the answers; no key and no UserId in the diagnostics or the logs", function()
+	local f = started({ server = selectionServer(function(key)
+		if key == "KAEL" then
+			return { status = 200, body = { outcome = "accepted" } }
+		elseif key == "NOVA" then
+			return { status = 200, body = { outcome = "unknown_key" } }
+		elseif key == "GONE" then
+			return { status = 200, body = { outcome = "unavailable" } }
+		end
+		return { status = 503 }
+	end) })
+	eq(f.panelRequest(panelFor(f, 1111111), "use", "KAEL"), "accepted")
+	eq(f.panelRequest(panelFor(f, 2222222), "use", "NOVA"), "unknown_key")
+	eq(f.panelRequest(panelFor(f, 3333333), "use", "GONE"), "unavailable")
+	eq(f.panelRequest(panelFor(f, 4444444), "use", "DOWN"), "failed")
+	eq(f.panelRequest(panelFor(f, 5555555), "use", "SHUTX1"), "unknown_key")
+	local diagnostics = f.client:getDiagnostics()
+	local outcomes = diagnostics.keyPanelOutcomes
+	eq(outcomes.accepted, 1)
+	eq(outcomes.unknown_key, 2)
+	eq(outcomes.unavailable, 1)
+	eq(outcomes.failed, 1)
+	eq(outcomes.busy, 0)
+	eq(outcomes.throttled, 0)
+	eq(outcomes.cleared, nil, "no removal answer")
+	eq(count(f.logs, "info", "key panel:"), 4, "only the four answers from R3FTO print a line")
+	eq(count(f.logs, "info", "key panel: unknown key"), 1, "the key refused on this server prints nothing")
+	for _, text in strings(diagnostics) do
+		for _, secret in { "KAEL", "NOVA", "GONE", "DOWN", "SHUTX1", "1111111", "2222222", "3333333", "4444444", "5555555" } do
+			assert(not string.find(text, secret, 1, true), "a key or a UserId in the diagnostics")
+		end
+	end
+	for _, line in f.logs do
+		for _, secret in { "KAEL", "NOVA", "GONE", "DOWN", "SHUTX1", "1111111", "2222222", "3333333", "4444444", "5555555", "<secret>" } do
+			assert(not string.find(line.message, secret, 1, true), "a key, a UserId or the token in a log line")
+		end
+	end
+
+	local quiet = Fakes.runtime()
+	assert(quiet.client:start({ environment = "production", quiet = true }))
+	local lines = #quiet.logs
+	eq(quiet.panelRequest(panelFor(quiet, 1234567), "use", "KAEL"), "accepted")
+	eq(#quiet.logs, lines, "quiet hides the answer lines")
+end)
+
+test("a closing SDK answers failed and sends nothing", function()
+	local f = started()
+	local player = panelFor(f, 1234567)
+	f.close()
+	eq(f.panelRequest(player, "use", "KAEL"), "failed")
+	eq(#selections(f), 0)
+	eq(count(f.logs, "info", "key panel:"), 0, "a local answer prints nothing")
+	eq(f.client:getDiagnostics().keyPanelOutcomes.failed, 1, "but it is counted")
+end)
+
+test("the panel keeps only the letters A-Z and maps every answer token to its state", function()
+	eq(Look.normalize("kael"), "KAEL")
+	eq(Look.normalize("k a-e_l1"), "KAEL", "only letters")
+	eq(Look.normalize(string.rep("ab", 10)), string.rep("AB", 8), "at most 16")
+	eq(Look.normalize("KÄEL"), "KEL", "a non-ASCII letter is dropped")
+	eq(Look.normalize(nil), "")
+	eq(Look.isKey("KAE"), false)
+	eq(Look.isKey("KAEL"), true)
+	eq(Look.isKey(string.rep("K", 16)), true)
+	eq(Look.isKey(string.rep("K", 17)), false)
+	eq(Look.isKey("kael"), false, "the box holds upper case only")
+	eq(Look.isKey(""), false)
+
+	local expected = {
+		checking = "checking",
+		accepted = "accepted",
+		unknown_key = "notFound",
+		unavailable = "notReady",
+		busy = "tryLater",
+		throttled = "tryLater",
+		failed = "tryLater",
+		timeout = "tryLater",
+	}
+	for token, state in expected do
+		eq(Look.stateFor(token), state, token)
+	end
+	eq(Look.stateFor("cleared"), "tryLater", "there is no removed state")
+	eq(Look.stateFor("Your key was removed by the server"), "tryLater", "text from elsewhere is never shown")
+	eq(Look.stateFor(nil), "tryLater")
+	eq(Look.stateFor({ outcome = "accepted" }), "tryLater")
+	eq(Look.STATES.removed, nil)
+	eq(Look.STATES.cleared, nil)
+
+	local names = {}
+	for name, state in Look.STATES do
+		table.insert(names, name)
+		assert(Look.COLOURS[state.colour] ~= nil, name .. " uses a design colour")
+		eq(state.clearBox, name == "accepted", name .. " empties the box only when accepted")
+	end
+	table.sort(names)
+	eq(table.concat(names, ","), "accepted,checking,notFound,notReady,ready,tryLater")
+	eq(Look.TIMEOUT, 15)
+	assert(#Look.LONGEST_STATUS > 0)
+end)
+
 -- Runner ---------------------------------------------------------------------------------------------------------------
 
 local passed, failed = 0, 0
